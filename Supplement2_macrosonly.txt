@@ -1,0 +1,712 @@
+/* Collection of modules/subroutines for bt and bt_zt macros - RUN FIRST
+*/
+/* use as needed */
+libname local "C:\Temp\BT_ZT";
+
+/* Bang-Tsiatis
+%bt macro parameters (when you only have total cost per person; if cost history is available, compute BT in bt_zt macro):
+   ALL INPUT VARIABLES MUST BE NUMERIC
+   required:
+		ds = input dataset name (a dataset must have the following variables 
+			id = subject id
+			delta = a event/censoring indicator, with the value 1 indicating an event time and the value 0 indicating a censored time
+			surv = survival time in days (if ties, may break ties so that events happened shortly before censoring, e.g., add 0.001 to censored survival times at ties.)
+			totcost = total cost
+			)
+	optional:
+		L = limit time, default is 75th percentile of followup time, and L > max(surv) is not allowed
+		r = discounting rate for survival time, default is 0 (0.03, 0.05, etc. may be used)
+        rcost = annual discounting rate for cost, default is 0
+*/
+
+/* Zhao-Tian
+%bt_zt macro parameters (when you have cost history data):
+    ALL INPUT VARIABLES MUST BE NUMERIC
+    required:
+		surv_ds = survival dataset (a dataset must have the following variables
+			id = subject_id
+			surv = survival time in days (if ties, may break ties so that events happened shortly before censoring, e.g., add 0.001 to censored survival times at ties.)
+			delta = a event/censoring indicator, with the value 1 indicating an event time and the value 0 indicating a censored time)
+		cost_ds = cost dataset (a dataset must have the following variables
+			cid = cost id, the same as id in surv_ds
+			start = start day
+			stop = stop day
+			cost = medical cost)
+	optional:
+		L = limit time, default is 75th percentile of followup time, and L > max(surv) is not allowed
+		r = discounting rate for survival time, default is 0 (0.03, 0.05, etc. may be used)
+        rcost = annual discounting rate for cost, default is 0
+*/
+************************************ MODULES FOR BT AND BT_ZT MACROS ********************************************;
+
+proc iml;
+	/* Module to truncate the survival time to L */
+	start TrunSurv(Delta, surv, tDelta, tsurv) global (L,n);
+		tsurv=surv;
+		tDelta=Delta;
+
+		do i= 1 to n;
+			if surv[i]>L then
+				do;
+					tsurv[i]=L;
+					tDelta[i]=1;
+				end;
+		end;
+
+	finish TrunSurv;
+	store module = TrunSurv;
+
+	/* Module to calculate the proportion of data that is censored */
+	start CalCensor(tDelta) global (L,n);
+		cens=1-tDelta;
+		percens=sum(cens)/n;
+		return(percens);
+	finish CalCensor;
+	store module= CalCensor;
+
+	/* Module to carry forward the survival function estimate at the last failure time */
+	start ChangeKmSurv(tpsurv, tpDelta, survival, surv, Delta, kc) global (L,n);
+		minkc=1000;
+		nn=nrow(tpsurv);
+		kc=j(n,1,0);
+
+		do j= 1 to nn;
+			if (survival[j]>=0 & survival[j]<minkc) then
+				do;
+					minkc=survival[j];
+					maxtime=tpsurv[j];
+				end;
+		end;
+
+		do i= 1 to n;
+			if (surv[i]>maxtime) then
+				kc[i]=minkc;
+			else
+				do;
+					do j = 1 to nn;
+						if (surv[i]=tpsurv[j]) then
+							kc[i]=survival[j];
+					end;
+				end;
+		end;
+
+	finish ChangeKmSurv;
+	store module = ChangeKmSurv;
+
+	/* Module to calculate the total cost */
+	/* This Module takes less time to run compared to the routine calculating cumulative cost*/
+	start CalTCost(totcost, tcost, surv) global (L, n, rcost);
+		tcost=j(n,1,0);
+
+		do i= 1 to n;
+			if surv[i] >= L then
+			     tcost[i]=totcost[i]/surv[i]*L;
+			else tcost[i]=totcost[i];
+	/* Discounting cost */
+		         tcost[i]= tcost[i]*(1 - rcost)**(min(surv[i],L)/365.25);
+        end;
+
+	finish CalTCost;
+	store module=CalTCost;
+
+	start CalTCostZT(cid, start, stop, cost, id, tsurv, tcost) global (n, nobs, rcost);
+		tcost=j(n,1,0);
+
+		do i= 1 to n;
+			do k=1 to nobs;
+				if (cid[k] = id[i] & start [k] <= tsurv[i]) then
+					do;
+						if (stop[k] > tsurv[i]) then
+							tcost[i]=tcost[i]+cost[k]*(tsurv[i]-start[k]+1.0)/(stop[k]-start[k]+1.0);
+						else tcost[i]=tcost[i]+cost[k];
+					end;
+			end;
+	/* Discounting cost */
+		            tcost[i]= tcost[i]*(1 - rcost)**(tsurv[i]/365.25);
+		end;
+
+	finish CalTCostZT;
+	store module = CalTCostZT;
+
+	/* Module to calculate the simple weighted estimator for the mean cost */
+	start CalOurMean(tDelta, kc, tcost) global (n);
+		mymean=0.;
+
+		do i= 1 to n;
+			if (tDelta[i]=1) then
+				mymean = mymean + tcost[i]/kc[i];
+		end;
+
+		mymean = mymean/n;
+		return(mymean);
+	finish CalOurMean;
+	store module= CalOurMean;
+
+	/* Module to calculate the variance of the simple weighted estimator */
+	start CalOurVar(tsurv, tDelta, s, kc, tcost, mymean) global (n);
+		temp1 = 0.; /* part 1 of equation (2) */
+		temp2 = 0.; /* part 2 of equation (2) */
+
+		do i= 1 to n;
+			if (tDelta[i]=1) then
+				temp1 = temp1 + (tcost[i]-mymean)**2/kc[i];
+		end;
+
+		temp1 =temp1 / n;
+
+		do j= 1 to n;
+			e=0.;
+			f=0.;
+
+			if (tDelta[j]=0) then
+				do;
+					do i= 1 to n;
+						if(tDelta[i]=1 & tsurv[i]>=tsurv[j]) then
+							do;
+								e = e + tcost[i]/kc[i];
+								f = f + (tcost[i])**2/kc[i];
+							end;
+					end;
+
+					e = e/(s[j]*n);
+					f = f/(s[j]*n);
+					temp2 = temp2 + (f-e*e)/(kc[j]*kc[j]);
+				end;
+		end;
+
+		temp2 = temp2/n;
+		myvar = temp1+temp2;
+		myvar = myvar/n;
+		return(myvar);
+	finish CalOurVar;
+	store module = CalOurVar;
+
+	/* Module to calculate the additional terms for the improved estimator and its variance */
+	start CalMeanAdd(tsurv, tDelta, kc, s, tcost, culcost, meanadd, varsub) global (n);
+
+		/* First calculate Ubar[j] and risk set y[j] at censoring places */
+		Ubar=j(n,1,0);
+		y=j(n,1,0);
+
+		do j= 1 to n;
+			if (tDelta[j]=0) then
+				do;
+					do i= 1 to n;
+						if (tsurv[i]>=tsurv[j]) then
+							do;
+								Ubar[j] = Ubar[j]+culcost[i,j];
+								y[j] = y[j]+1;
+							end;
+					end;
+
+					Ubar[j] = Ubar[j]/y[j];
+				end;
+		end;
+
+		/* Next calculate the additional terms for the improved estimator and its variance */
+		part1=0.; /* Additional term for the improved estimator */
+		part2=0.; /* Second term in the variance formula for the improved estimator, equation (4) */
+		part3=0.; /* Third term in the variance formula for the improved estimator, equation (4) */
+
+		do j= 1 to n;
+			if (tDelta[j]=0) then
+				do;
+					part1 = part1+ (tcost[j]-Ubar[j])/kc[j];
+					gu=0.;
+					par2temp=0.;
+					par3temp=0.;
+
+					do i= 1 to n;
+						if(tDelta[i]=1 & tsurv[i]>=tsurv[j]) then
+							gu = gu + tcost[i]/kc[i];
+					end;
+
+					gu = gu/(s[j]*n);
+
+					do i= 1 to n;
+						if(tDelta[i]=1 & tsurv[i]>=tsurv[j]) then
+							par2temp = par2temp + (tcost[i]-gu)*(culcost[i,j]-Ubar[j])/kc[i];
+					end;
+
+					part2 = part2 + par2temp/(y[j]*kc[j]);
+
+					do i= 1 to n;
+						if(tsurv[i]>=tsurv[j]) then
+							par3temp = par3temp + (culcost[i,j]-Ubar[j])**2;
+					end;
+
+					part3 = part3 + par3temp/(y[j]*kc[j]*kc[j]);
+				end;
+		end;
+
+		part1 = part1/n;
+		meanadd=part1;
+		varsub=(2.0*part2-part3)/(n*n);
+	finish CalMeanAdd;
+	store module = CalMeanAdd;
+
+	/* Module to calculate the cumulative cost */
+	/* This routine is needed for calculating the improved estimator */
+	start CalCulCost(cid, start, stop, cost, id, tsurv, tDelta, culcost) global (n, nobs, rcost);
+		culcost=j(n,n,0);
+
+		do i= 1 to n;
+			do j= 1 to n;
+				if (tsurv[i]>=tsurv[j] & tDelta[j]=0) then
+					do;
+						do k = 1 to nobs;
+							if (cid [k] = id[i] & start [k] <= tsurv[j]) then
+								do;
+	/* Discounting cost */
+		           cost[k]=cost[k]*(1 - rcost)**(((min(start[k],tsurv[j])+min(stop[k],tsurv[j]))/2)/365.25);
+									if (stop[k] > tsurv[j]) then
+										culcost[i,j]=culcost[i,j]+cost[k]*(tsurv[j]-start[k]+1.0)/(stop[k]-start[k]+1.0);
+									else culcost[i,j]=culcost[i,j]+cost[k];
+								end;
+						end;
+					end;
+			end;
+		end;
+
+	finish CalCulCost;
+	store module = CalCulCost;
+
+	/* Module to calculate the covariance between mean survival time and simple weighted cost estimator */
+	start CalOurCov(tDelta, tsurv, s, kc, tcost, mymean, dsurv, tmean) global (n);
+		temp1 = 0.;
+		temp2 = 0.;
+
+		do i= 1 to n;
+			if (tDelta[i]=1) then
+				temp1 = temp1 + tcost[i]*dsurv[i]/kc[i];
+		end;
+
+		temp1 = temp1/n;
+		temp1 = temp1 - mymean*tmean;
+
+		do j= 1 to n;
+			gtc=0.;
+			gt=0.;
+			gc=0.;
+
+			if (tDelta[j]=0) then
+				do;
+					do i= 1 to n;
+						if(tDelta[i]=1 & tsurv[i]>=tsurv[j]) then
+							do;
+								gtc = gtc + tcost[i]*dsurv[i]/kc[i];
+								gt = gt + dsurv[i]/kc[i];
+								gc = gc + tcost[i]/kc[i];
+							end;
+					end;
+
+					gtc = gtc/(s[j]*n);
+					gt = gt/(s[j]*n);
+					gc = gc/(s[j]*n);
+					temp2 = temp2 + (gtc-gt*gc)/(kc[j]*kc[j]);
+				end;
+		end;
+
+		temp2 = temp2/n;
+		mycov = temp1+temp2;
+		mycov = mycov/n;
+		return(mycov);
+	finish CalOurCov;
+	store module = CalOurCov;
+
+	start CalCovSub(tDelta, tsurv, s, kc, culcost, dsurv) global (n);
+
+		/* First calculate Ubar[j] and risk set y[j] at censoring places */
+		Ubar=j(n,1,0);
+		y=j(n,1,0);
+
+		do j= 1 to n;
+			if (tDelta[j]=0) then
+				do;
+					do i= 1 to n;
+						if (tsurv[i]>=tsurv[j]) then
+							do;
+								Ubar[j] = Ubar[j] + culcost[i,j];
+								y[j] = y[j] + 1;
+							end;
+					end;
+
+					Ubar[j] = Ubar[j]/y[j];
+				end;
+		end;
+
+		/* Next calculate the additional term for the covariance using improved cost estimator*/
+		part2=0.;
+
+		do j= 1 to n;
+			if (tDelta[j]=0) then
+				do;
+					par2temp=0.;
+					gt = 0.;
+
+					do i= 1 to n;
+						if(tDelta[i]=1 & tsurv[i]>=tsurv[j]) then
+							gt = gt +  dsurv[i]/kc[i];
+					end;
+
+					gt = gt/(s[j]*n);
+
+					do i= 1 to n;
+						if(tDelta[i]=1 & tsurv[i]>=tsurv[j]) then
+							par2temp = par2temp+(culcost[i,j]-Ubar[j])*(dsurv[i]-gt)/kc[i];
+					end;
+
+					part2 = part2 + par2temp/(y[j]*kc[j]);
+				end;
+		end;
+
+		covsub=part2/(n*n);
+		return(covsub);
+	finish CalCovSub;
+	store module = CalCovSub;
+
+	/* Module to calculate the Kaplan Meier estimator for K(t)=Pr(C>t) */
+	start KmCal(surv, Delta,kc);
+		create InputDataSet var {surv Delta};
+		append;
+		close InputDataSet;
+		submit;
+
+	proc lifetest data= InputDataSet noprint outsurv=OutputData plots = none;
+		time surv*Delta(1);
+	run;
+
+	data Out;
+		set OutputData;
+		tpDelta=1 - _CENSOR_;
+		tpsurv = surv;
+	run;
+
+	endsubmit;
+	use Out;
+		read all var {tpsurv tpDelta survival};
+		run ChangeKmSurv(tpsurv, tpDelta, survival, surv, Delta, kc);
+	close Out;
+	finish KmCal;
+	store module= KmCal;
+quit;
+
+
+************************************************ BT MACRO *******************************************************;
+%macro bt(ds, L, r = 0, rcost = 0);
+	proc sort data = &ds;
+		by id;
+	run;
+
+	/* Check for missing values */
+	data _null_;
+		set &ds.;
+		if nmiss(id, delta, surv, totcost) ne 0 then do;
+		put 'ERR' 'OR: Input data has missing values - the processing is terminated.';
+		abort;
+		end;
+	run;	
+
+    %if %sysevalf(%superq(L)=,boolean) = 1 %then %do;
+		proc univariate data = &ds. noprint;
+			var surv;
+			output out = L (rename = (L75 = L)) pctlpts = 75 pctlpre = L;
+		run;
+		data L;
+			set L;
+			L = round(L);
+			call symput('L', strip(L));
+		run;
+	%end;
+	%else %do;
+		proc sql noprint;
+			select max(surv) into :L_max trimmed 
+			from &ds.;
+		quit;
+		%if %sysevalf(&L. > &L_max.,boolean) %then %do;
+			data err;
+				Warning= 'L = limit time, default is 75th percentile of followup time, and L > max(surv) is not allowed.';
+			run;
+			proc report data = err;
+				column Warning;
+				define Warning / display style={background=red};
+			run;
+			%put 'L = limit time, default is 75th percentile of followup time, and L > max(surv) is not allowed';
+			%abort;
+		%end;
+		%else %do;
+			data L;
+				L = round(&L);
+			run;
+		%end;
+	%end;
+
+	proc iml;
+		/* Load modules */
+		load module = TrunSurv;
+		load module = CalCensor;
+		load module = ChangeKmSurv;
+		load module = CalTCost;
+		load module = CalOurMean;
+		load module = CalOurVar;
+		load module = CalOurCov;
+		load module = KmCal;
+
+		/* Read survival and cost data */
+		use &ds;
+			read  all var {id Delta surv totcost}; /*Subject ID, death indicator, survival time and total cost;*/
+		close &ds;
+
+		/* Define global variables */
+		n=nrow(id); /* number of subjects */
+		use L;
+			read all var{L};
+		close L;
+		rcost = &rcost.;
+
+		/* Truncate survival time to L, name the new variables tsurv and tDelta */
+		run TrunSurv(Delta, surv, tDelta, tsurv);
+
+		/* Make the largest observation a failure */
+		do i= 1 to n;
+			if (tsurv[i] = L) then tDelta[i]=1;
+		end;
+
+		/* Calculate the proportion of data that is Censored */
+		percens=CalCensor(tDelta);
+
+		/* Calculate the Kaplan Meier estimator for K(t)=Pr(C>t), name it kc */
+		run KmCal(tsurv, tDelta, kc);
+
+		/* Calculate the Kaplan Meier estimator for S(t)=Pr(C>t), name it s */
+		censor=j(n,1,0);
+
+		do i= 1 to n;
+			censor[i]=1-tDelta[i];
+		end;
+		run KmCal(tsurv, censor, s);
+
+		/* Calculate the total cost for each subject, needed for the simple weighted estimator */
+		run CalTCost(totcost, tcost, surv);
+
+		/* Calculate the mean using the simple weighted estimator */
+		mean_sw=CalOurMean(tDelta, kc, tcost);
+
+		/* Calculate the standard error of the simple weighted estimator */
+		var_sw=CalOurVar(tsurv, tDelta, s, kc, tcost, mean_sw);
+		se_sw=sqrt(var_sw);
+
+		/* Calculate the mean discounted survival time and its standard error*/
+		dsurv=j(n,1,0);
+
+		do i= 1 to n;
+			if &r. > 0 then
+				dsurv[i]=365.25/&r.*(1.0-exp(-&r.*tsurv[i]/365.25));
+			else dsurv[i]=tsurv[i];
+		end;
+
+		mean_T = CalOurMean(tDelta, kc, dsurv);
+		var_T = CalOurVar(tsurv, tDelta, s, kc, dsurv, mean_T);
+		se_T = sqrt(var_T);
+
+		/* Calculate the covariance between mean survival time and simple weighted cost estimator */
+		cov_sw = CalOurCov(tDelta, tsurv, s, kc, tcost, mean_sw, dsurv, mean_T);
+
+		table = round(n || percens || &r. || rcost || L || round(mean_T, 0.1) || se_T || round(mean_sw, 0.1) || se_sw || cov_sw, 0.01)`;
+		vars = {"Sample size", 
+                "Proportion of censoring", 
+				"Annual discounting rate for survival time (r)",
+				"Annual discounting rate for cost (rcost)", 
+				"Time limit (L), days",
+				"KM: Mean survival time", 
+				"KM: Standard error for the mean survival time", 
+				"BT: Simple weighted estimator for mean cost", 
+				"BT: Standard error estimate for the simple weighted estimator",
+				"BT: Covariance between mean survival time and mean cost"};
+		tbl = TableCreate("Statistics", vars);
+		call TableAddVar(tbl, {"Value"}, table);
+		call TablePrint(tbl) ID = "Statistics" label = "Output from BT macro for &ds dataset";
+	quit;
+%mend;
+
+******************************************* BT_ZT MACRO *********************************************************;
+
+%macro bt_zt(surv_ds, cost_ds, L, r = 0, rcost = 0);
+	title;
+	proc sort data = &surv_ds;
+		by id;
+	run;
+	proc sort data = &cost_ds;
+		by cid;
+	run;
+
+	/* Check for missing values */
+	data _null_;
+		set &surv_ds.;
+		if nmiss(id, surv, Delta) ne 0 then do;
+		put 'ERR' 'OR: Input data has missing value(s) - the processing is terminated.';
+		abort;
+		end;
+	run;
+	data _null_;
+		set &cost_ds.;
+		if nmiss(cid, start, stop, cost) ne 0 then do;
+		put 'ERR' 'OR: Input data has missing value(s) - the processing is terminated.';
+		abort;
+		end;
+	run;
+
+	%if %sysevalf(%superq(L)=,boolean) = 1 %then %do;
+		proc univariate data = &surv_ds. noprint;
+			var surv;
+			output out = L (rename = (L75 = L)) pctlpts = 75 pctlpre = L;
+		run;
+		data L;
+			set L;
+			L = round(L);
+			call symput('L', strip(L));
+		run;
+	%end;
+	%else %do;
+		proc sql noprint;
+			select max(surv) into :L_max trimmed 
+			from &surv_ds.;
+		quit;
+		%if %sysevalf(&L. > &L_max.,boolean) %then %do;
+			data err;
+				Warning= 'L = limit time, default is 75th percentile of followup time, and L > max(surv) is not allowed.';
+			run;
+			proc report data = err;
+				column Warning;
+				define Warning / display style={background=red};
+			run;
+			%put 'L = limit time, default is 75th percentile of followup time, and L > max(surv) is not allowed';
+			%abort;
+		%end;
+		%else %do;
+			data L;
+				L = round(&L);
+			run;
+		%end;
+	%end;
+
+	proc iml;
+		/* Load modules */
+		load module = TrunSurv;
+		load module = CalCensor;
+		load module = ChangeKmSurv;
+		load module = CalTCostZT;
+		load module = CalOurMean;
+		load module = CalOurVar;
+		load module = CalMeanAdd;
+		load module = CalCulCost;
+		load module = CalOurCov;
+		load module = CalCovSub;
+		load module = KmCal;
+
+		/* Read survival data */
+		use &surv_ds.;
+			read  all var {id Delta surv};
+
+		/*Subject ID, death indicator, and survival time;*/
+		close &surv_ds.;
+
+		/* Read cost data */
+		use &cost_ds.;
+			read  all var {cid start stop cost};
+
+		/* Subject ID, cost start date, stop date, cost incurred */
+		/*show names;*/
+		close &cost_ds.;
+
+		/* Define global variables */
+		n=nrow(id); /* number of subjects */
+		nobs=nrow(cid); /* total number of cost observations */
+		use L;
+			read all var{L};
+		close L;
+		rcost = &rcost.;
+
+		/* Truncate survival time to L, name the new variables tsurv and tDelta */
+		run TrunSurv(Delta, surv, tDelta, tsurv);
+
+		/* Make the largest observation a failure */
+		do i= 1 to n;
+			if (tsurv[i] = L) then tDelta[i]=1;
+		end;
+
+		/* Calculate the proportion of data that is censored */
+		percens=CalCensor(tDelta);
+
+		/* Calculate the Kaplan Meier estimator for K(t)=Pr(C>t), name it kc */
+		run KmCal(tsurv, tDelta, kc);
+
+		/* Calculate the Kaplan Meier estimator for S(t)=Pr(C>t), name it s */
+		censor=j(n,1,0);
+
+		do i= 1 to n;
+			censor[i]=1-tDelta[i];
+		end;
+		run KmCal(tsurv, censor, s);
+
+		/* Calculate the total cost for each subject, needed for the simple weighted estimator */
+		run CalTCostZT(cid, start, stop, cost, id, tsurv, tcost);
+
+		/* Calculate the mean using the simple weighted estimator */
+		mean_sw=CalOurMean(tDelta, kc, tcost);
+
+		/* Calculate the standard error of the simple weighted estimator */
+		var_sw=CalOurVar(tsurv, tDelta, s, kc, tcost, mean_sw);
+		se_sw=sqrt(var_sw);
+
+		/* Calculate the mean discounted survival time and its standard error*/
+		dsurv=j(n,1,0);
+
+		do i= 1 to n;
+			if &r. > 0 then
+				dsurv[i]=365.25/&r.*(1.0-exp(-&r.*tsurv[i]/365.25));
+			else dsurv[i]=tsurv[i];
+		end;
+
+		mean_T = CalOurMean(tDelta, kc, dsurv);
+		var_T = CalOurVar(tsurv, tDelta, s, kc, dsurv, mean_T);
+		se_T = sqrt(var_T);
+
+		/* Calculate cumulative cost at each censored time, needed for the improved estimator */
+		run CalCulCost(cid, start, stop, cost, id, tsurv, tDelta, culcost);
+
+		/* Calculate improved estimator and its standard error*/
+		run CalMeanAdd(tsurv, tDelta, kc, s, tcost, culcost, meanadd, varsub);
+
+		mean_imp = mean_sw+meanadd;
+		/* Calculate the 1st term in var_imp has mean_imp instead of mean_sw */
+	    var_sw1=CalOurVar(tsurv, tDelta, s, kc, tcost, mean_imp);
+		se_sw1=sqrt(var_sw1);
+		se_imp = sqrt(var_sw1-varsub);
+
+		/* Calculate the covariance between mean survival time and simple weighted cost estimator */
+		cov_sw = CalOurCov(tDelta, tsurv, s, kc, tcost, mean_sw, dsurv, mean_T);
+
+		/* Calculate the covariance between mean survival time and improved cost estimator */
+		covsub=CalCovSub(tDelta, tsurv, s, kc, culcost, dsurv);
+		cov_imp=cov_sw-covsub;
+
+		table = round(n || percens || &r. || rcost || L || round(mean_T, 0.1) || se_T || mean_sw || se_sw || round(mean_imp, 0.1) || se_imp || cov_sw || cov_imp, 0.01)`;
+		vars = {"Sample size", 
+            "Proportion of censoring", 
+		    "Annual discounting rate for survival time (r)",
+			"Annual discounting rate for cost (rcost)", 
+			"Time limit (L), days",
+			"KM: Mean survival time", 
+			"KM: Standard error for the mean survival time",
+			"BT: Simple weighted estimator for mean cost", 
+			"BT: Standard error estimate for the simple weighted estimator",
+			"ZT: Improved estimator for mean cost",
+			"ZT: Standard error of the improved estimator",
+			"BT: Covariance between mean survival time and the simple weighted cost estimator",
+			"ZT: Covariance between mean survival time and the improved cost estimator"};
+		tbl = TableCreate("Statistics", vars);
+		call TableAddVar(tbl, {"Value"}, table);
+		call TablePrint(tbl) ID = "Statistics" label = "Output from BT_ZT macro for &surv_ds. and &cost_ds. datasets";
+	quit;
+%mend;

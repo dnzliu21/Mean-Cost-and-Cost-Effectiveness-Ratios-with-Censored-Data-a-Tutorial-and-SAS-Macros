@@ -1,0 +1,60 @@
+/*1.	For ACER (in terms of $1 and per year)*/
+data one1; 
+*these 5 values can be computed from BT or ZT - enter by hand here;
+surv=1069/365.25;
+sesurv=62/365.25;
+cost=32844;
+secost=4349;
+covcs=61058/365.25; run;
+
+data one2; set one1;
+ t=1.96;
+ x=cost;
+ y=surv;
+ sxx=secost**2;
+ syy=sesurv**2;
+ sxy=covcs;
+
+ acer=cost/surv;
+*Fieller;
+ f=(x*y-t**2*sxy)**2-(x**2-t**2*sxx)*(y**2-t**2*syy);
+ lowbd=(x*y-t**2*sxy-sqrt(f))/(y**2-t**2*syy);
+ uppbd=(x*y-t**2*sxy+sqrt(f))/(y**2-t**2*syy);
+*Taylor;
+ var_acer=(cost/surv)**2*(secost**2/cost**2+sesurv**2/surv**2-2*covcs/(cost*surv));
+ lowbd_taylor=acer-t*sqrt(var_acer);
+ uppbd_taylor=acer+t*sqrt(var_acer); run;
+
+proc print data=one2; var acer lowbd uppbd; run;
+proc print data=one2; var acer lowbd_taylor uppbd_taylor; run;
+
+/*2.	For ICER (in terms of $1000 and per year)*/
+data two1; 
+*need two groups so run BT or ZT for 2 groups first;
+surv1=1069/365.25;
+sesurv1=62/365.25;
+cost1=32844/1000;
+secost1=4349/1000;
+covcs1=61058/365.25/1000;
+
+surv2=1170/365.25;
+sesurv2=80/365.25;
+cost2=56718/1000;
+secost2=6000/1000;
+covcs2=60000/365.25/1000; run;
+
+data two2; set two1;
+ t=1.96; 
+ x=cost2-cost1;
+ y=surv2-surv1;
+ sxx=secost1**2+secost2**2;
+ syy=sesurv1**2+sesurv2**2;
+ sxy=covcs1+covcs2;
+
+ icer=(cost2-cost1)/(surv2-surv1);
+*Fieller;
+ f=(x*y-t**2*sxy)**2-(x**2-t**2*sxx)*(y**2-t**2*syy);
+ lowbd=(x*y-t**2*sxy-sqrt(f))/(y**2-t**2*syy);
+ uppbd=(x*y-t**2*sxy+sqrt(f))/(y**2-t**2*syy); run;
+
+proc print data=two2; var icer lowbd uppbd; run;

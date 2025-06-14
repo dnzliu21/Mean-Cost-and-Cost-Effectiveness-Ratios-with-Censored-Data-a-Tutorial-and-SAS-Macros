@@ -1,0 +1,3132 @@
+* This file includes SAS macros + datasets + sample reruns to reproduce tables/results in manuscript;
+/* Collection of modules/subroutines for bt and bt_zt macros - RUN FIRST
+*/
+/* use as needed */
+libname local "C:\Temp\BT_ZT";
+
+/* Bang-Tsiatis
+%bt macro parameters (when you only have total cost per person; if cost history is available, compute BT in bt_zt macro):
+   ALL INPUT VARIABLES MUST BE NUMERIC
+   required:
+		ds = input dataset name (a dataset must have the following variables 
+			id = subject id
+			delta = a event/censoring indicator, with the value 1 indicating an event time and the value 0 indicating a censored time
+			surv = survival time in days (if ties, may break ties so that events happened shortly before censoring, e.g., add 0.001 to censored survival times at ties.)
+			totcost = total cost
+			)
+	optional:
+		L = limit time, default is 75th percentile of followup time, and L > max(surv) is not allowed
+		r = discounting rate for survival time, default is 0 (0.03, 0.05, etc. may be used)
+        rcost = annual discounting rate for cost, default is 0
+*/
+
+/* Zhao-Tian
+%bt_zt macro parameters (when you have cost history data):
+    ALL INPUT VARIABLES MUST BE NUMERIC
+    required:
+		surv_ds = survival dataset (a dataset must have the following variables
+			id = subject_id
+			surv = survival time in days (if ties, may break ties so that events happened shortly before censoring, e.g., add 0.001 to censored survival times at ties.)
+			delta = a event/censoring indicator, with the value 1 indicating an event time and the value 0 indicating a censored time)
+		cost_ds = cost dataset (a dataset must have the following variables
+			cid = cost id, the same as id in surv_ds
+			start = start day
+			stop = stop day
+			cost = medical cost)
+	optional:
+		L = limit time, default is 75th percentile of followup time, and L > max(surv) is not allowed
+		r = discounting rate for survival time, default is 0 (0.03, 0.05, etc. may be used)
+        rcost = annual discounting rate for cost, default is 0
+*/
+************************************ MODULES FOR BT AND BT_ZT MACROS ********************************************;
+
+proc iml;
+	/* Module to truncate the survival time to L */
+	start TrunSurv(Delta, surv, tDelta, tsurv) global (L,n);
+		tsurv=surv;
+		tDelta=Delta;
+
+		do i= 1 to n;
+			if surv[i]>L then
+				do;
+					tsurv[i]=L;
+					tDelta[i]=1;
+				end;
+		end;
+
+	finish TrunSurv;
+	store module = TrunSurv;
+
+	/* Module to calculate the proportion of data that is censored */
+	start CalCensor(tDelta) global (L,n);
+		cens=1-tDelta;
+		percens=sum(cens)/n;
+		return(percens);
+	finish CalCensor;
+	store module= CalCensor;
+
+	/* Module to carry forward the survival function estimate at the last failure time */
+	start ChangeKmSurv(tpsurv, tpDelta, survival, surv, Delta, kc) global (L,n);
+		minkc=1000;
+		nn=nrow(tpsurv);
+		kc=j(n,1,0);
+
+		do j= 1 to nn;
+			if (survival[j]>=0 & survival[j]<minkc) then
+				do;
+					minkc=survival[j];
+					maxtime=tpsurv[j];
+				end;
+		end;
+
+		do i= 1 to n;
+			if (surv[i]>maxtime) then
+				kc[i]=minkc;
+			else
+				do;
+					do j = 1 to nn;
+						if (surv[i]=tpsurv[j]) then
+							kc[i]=survival[j];
+					end;
+				end;
+		end;
+
+	finish ChangeKmSurv;
+	store module = ChangeKmSurv;
+
+	/* Module to calculate the total cost */
+	/* This Module takes less time to run compared to the routine calculating cumulative cost*/
+	start CalTCost(totcost, tcost, surv) global (L, n, rcost);
+		tcost=j(n,1,0);
+
+		do i= 1 to n;
+			if surv[i] >= L then
+			     tcost[i]=totcost[i]/surv[i]*L;
+			else tcost[i]=totcost[i];
+	/* Discounting cost */
+		         tcost[i]= tcost[i]*(1 - rcost)**(min(surv[i],L)/365.25);
+        end;
+
+	finish CalTCost;
+	store module=CalTCost;
+
+	start CalTCostZT(cid, start, stop, cost, id, tsurv, tcost) global (n, nobs, rcost);
+		tcost=j(n,1,0);
+
+		do i= 1 to n;
+			do k=1 to nobs;
+				if (cid[k] = id[i] & start [k] <= tsurv[i]) then
+					do;
+						if (stop[k] > tsurv[i]) then
+							tcost[i]=tcost[i]+cost[k]*(tsurv[i]-start[k]+1.0)/(stop[k]-start[k]+1.0);
+						else tcost[i]=tcost[i]+cost[k];
+					end;
+			end;
+	/* Discounting cost */
+		            tcost[i]= tcost[i]*(1 - rcost)**(tsurv[i]/365.25);
+		end;
+
+	finish CalTCostZT;
+	store module = CalTCostZT;
+
+	/* Module to calculate the simple weighted estimator for the mean cost */
+	start CalOurMean(tDelta, kc, tcost) global (n);
+		mymean=0.;
+
+		do i= 1 to n;
+			if (tDelta[i]=1) then
+				mymean = mymean + tcost[i]/kc[i];
+		end;
+
+		mymean = mymean/n;
+		return(mymean);
+	finish CalOurMean;
+	store module= CalOurMean;
+
+	/* Module to calculate the variance of the simple weighted estimator */
+	start CalOurVar(tsurv, tDelta, s, kc, tcost, mymean) global (n);
+		temp1 = 0.; /* part 1 of equation (2) */
+		temp2 = 0.; /* part 2 of equation (2) */
+
+		do i= 1 to n;
+			if (tDelta[i]=1) then
+				temp1 = temp1 + (tcost[i]-mymean)**2/kc[i];
+		end;
+
+		temp1 =temp1 / n;
+
+		do j= 1 to n;
+			e=0.;
+			f=0.;
+
+			if (tDelta[j]=0) then
+				do;
+					do i= 1 to n;
+						if(tDelta[i]=1 & tsurv[i]>=tsurv[j]) then
+							do;
+								e = e + tcost[i]/kc[i];
+								f = f + (tcost[i])**2/kc[i];
+							end;
+					end;
+
+					e = e/(s[j]*n);
+					f = f/(s[j]*n);
+					temp2 = temp2 + (f-e*e)/(kc[j]*kc[j]);
+				end;
+		end;
+
+		temp2 = temp2/n;
+		myvar = temp1+temp2;
+		myvar = myvar/n;
+		return(myvar);
+	finish CalOurVar;
+	store module = CalOurVar;
+
+	/* Module to calculate the additional terms for the improved estimator and its variance */
+	start CalMeanAdd(tsurv, tDelta, kc, s, tcost, culcost, meanadd, varsub) global (n);
+
+		/* First calculate Ubar[j] and risk set y[j] at censoring places */
+		Ubar=j(n,1,0);
+		y=j(n,1,0);
+
+		do j= 1 to n;
+			if (tDelta[j]=0) then
+				do;
+					do i= 1 to n;
+						if (tsurv[i]>=tsurv[j]) then
+							do;
+								Ubar[j] = Ubar[j]+culcost[i,j];
+								y[j] = y[j]+1;
+							end;
+					end;
+
+					Ubar[j] = Ubar[j]/y[j];
+				end;
+		end;
+
+		/* Next calculate the additional terms for the improved estimator and its variance */
+		part1=0.; /* Additional term for the improved estimator */
+		part2=0.; /* Second term in the variance formula for the improved estimator, equation (4) */
+		part3=0.; /* Third term in the variance formula for the improved estimator, equation (4) */
+
+		do j= 1 to n;
+			if (tDelta[j]=0) then
+				do;
+					part1 = part1+ (tcost[j]-Ubar[j])/kc[j];
+					gu=0.;
+					par2temp=0.;
+					par3temp=0.;
+
+					do i= 1 to n;
+						if(tDelta[i]=1 & tsurv[i]>=tsurv[j]) then
+							gu = gu + tcost[i]/kc[i];
+					end;
+
+					gu = gu/(s[j]*n);
+
+					do i= 1 to n;
+						if(tDelta[i]=1 & tsurv[i]>=tsurv[j]) then
+							par2temp = par2temp + (tcost[i]-gu)*(culcost[i,j]-Ubar[j])/kc[i];
+					end;
+
+					part2 = part2 + par2temp/(y[j]*kc[j]);
+
+					do i= 1 to n;
+						if(tsurv[i]>=tsurv[j]) then
+							par3temp = par3temp + (culcost[i,j]-Ubar[j])**2;
+					end;
+
+					part3 = part3 + par3temp/(y[j]*kc[j]*kc[j]);
+				end;
+		end;
+
+		part1 = part1/n;
+		meanadd=part1;
+		varsub=(2.0*part2-part3)/(n*n);
+	finish CalMeanAdd;
+	store module = CalMeanAdd;
+
+	/* Module to calculate the cumulative cost */
+	/* This routine is needed for calculating the improved estimator */
+	start CalCulCost(cid, start, stop, cost, id, tsurv, tDelta, culcost) global (n, nobs, rcost);
+		culcost=j(n,n,0);
+
+		do i= 1 to n;
+			do j= 1 to n;
+				if (tsurv[i]>=tsurv[j] & tDelta[j]=0) then
+					do;
+						do k = 1 to nobs;
+							if (cid [k] = id[i] & start [k] <= tsurv[j]) then
+								do;
+	/* Discounting cost */
+		           cost[k]=cost[k]*(1 - rcost)**(((min(start[k],tsurv[j])+min(stop[k],tsurv[j]))/2)/365.25);
+									if (stop[k] > tsurv[j]) then
+										culcost[i,j]=culcost[i,j]+cost[k]*(tsurv[j]-start[k]+1.0)/(stop[k]-start[k]+1.0);
+									else culcost[i,j]=culcost[i,j]+cost[k];
+								end;
+						end;
+					end;
+			end;
+		end;
+
+	finish CalCulCost;
+	store module = CalCulCost;
+
+	/* Module to calculate the covariance between mean survival time and simple weighted cost estimator */
+	start CalOurCov(tDelta, tsurv, s, kc, tcost, mymean, dsurv, tmean) global (n);
+		temp1 = 0.;
+		temp2 = 0.;
+
+		do i= 1 to n;
+			if (tDelta[i]=1) then
+				temp1 = temp1 + tcost[i]*dsurv[i]/kc[i];
+		end;
+
+		temp1 = temp1/n;
+		temp1 = temp1 - mymean*tmean;
+
+		do j= 1 to n;
+			gtc=0.;
+			gt=0.;
+			gc=0.;
+
+			if (tDelta[j]=0) then
+				do;
+					do i= 1 to n;
+						if(tDelta[i]=1 & tsurv[i]>=tsurv[j]) then
+							do;
+								gtc = gtc + tcost[i]*dsurv[i]/kc[i];
+								gt = gt + dsurv[i]/kc[i];
+								gc = gc + tcost[i]/kc[i];
+							end;
+					end;
+
+					gtc = gtc/(s[j]*n);
+					gt = gt/(s[j]*n);
+					gc = gc/(s[j]*n);
+					temp2 = temp2 + (gtc-gt*gc)/(kc[j]*kc[j]);
+				end;
+		end;
+
+		temp2 = temp2/n;
+		mycov = temp1+temp2;
+		mycov = mycov/n;
+		return(mycov);
+	finish CalOurCov;
+	store module = CalOurCov;
+
+	start CalCovSub(tDelta, tsurv, s, kc, culcost, dsurv) global (n);
+
+		/* First calculate Ubar[j] and risk set y[j] at censoring places */
+		Ubar=j(n,1,0);
+		y=j(n,1,0);
+
+		do j= 1 to n;
+			if (tDelta[j]=0) then
+				do;
+					do i= 1 to n;
+						if (tsurv[i]>=tsurv[j]) then
+							do;
+								Ubar[j] = Ubar[j] + culcost[i,j];
+								y[j] = y[j] + 1;
+							end;
+					end;
+
+					Ubar[j] = Ubar[j]/y[j];
+				end;
+		end;
+
+		/* Next calculate the additional term for the covariance using improved cost estimator*/
+		part2=0.;
+
+		do j= 1 to n;
+			if (tDelta[j]=0) then
+				do;
+					par2temp=0.;
+					gt = 0.;
+
+					do i= 1 to n;
+						if(tDelta[i]=1 & tsurv[i]>=tsurv[j]) then
+							gt = gt +  dsurv[i]/kc[i];
+					end;
+
+					gt = gt/(s[j]*n);
+
+					do i= 1 to n;
+						if(tDelta[i]=1 & tsurv[i]>=tsurv[j]) then
+							par2temp = par2temp+(culcost[i,j]-Ubar[j])*(dsurv[i]-gt)/kc[i];
+					end;
+
+					part2 = part2 + par2temp/(y[j]*kc[j]);
+				end;
+		end;
+
+		covsub=part2/(n*n);
+		return(covsub);
+	finish CalCovSub;
+	store module = CalCovSub;
+
+	/* Module to calculate the Kaplan Meier estimator for K(t)=Pr(C>t) */
+	start KmCal(surv, Delta,kc);
+		create InputDataSet var {surv Delta};
+		append;
+		close InputDataSet;
+		submit;
+
+	proc lifetest data= InputDataSet noprint outsurv=OutputData plots = none;
+		time surv*Delta(1);
+	run;
+
+	data Out;
+		set OutputData;
+		tpDelta=1 - _CENSOR_;
+		tpsurv = surv;
+	run;
+
+	endsubmit;
+	use Out;
+		read all var {tpsurv tpDelta survival};
+		run ChangeKmSurv(tpsurv, tpDelta, survival, surv, Delta, kc);
+	close Out;
+	finish KmCal;
+	store module= KmCal;
+quit;
+
+
+************************************************ BT MACRO *******************************************************;
+%macro bt(ds, L, r = 0, rcost = 0);
+	proc sort data = &ds;
+		by id;
+	run;
+
+	/* Check for missing values */
+	data _null_;
+		set &ds.;
+		if nmiss(id, delta, surv, totcost) ne 0 then do;
+		put 'ERR' 'OR: Input data has missing values - the processing is terminated.';
+		abort;
+		end;
+	run;	
+
+    %if %sysevalf(%superq(L)=,boolean) = 1 %then %do;
+		proc univariate data = &ds. noprint;
+			var surv;
+			output out = L (rename = (L75 = L)) pctlpts = 75 pctlpre = L;
+		run;
+		data L;
+			set L;
+			L = round(L);
+			call symput('L', strip(L));
+		run;
+	%end;
+	%else %do;
+		proc sql noprint;
+			select max(surv) into :L_max trimmed 
+			from &ds.;
+		quit;
+		%if %sysevalf(&L. > &L_max.,boolean) %then %do;
+			data err;
+				Warning= 'L = limit time, default is 75th percentile of followup time, and L > max(surv) is not allowed.';
+			run;
+			proc report data = err;
+				column Warning;
+				define Warning / display style={background=red};
+			run;
+			%put 'L = limit time, default is 75th percentile of followup time, and L > max(surv) is not allowed';
+			%abort;
+		%end;
+		%else %do;
+			data L;
+				L = round(&L);
+			run;
+		%end;
+	%end;
+
+	proc iml;
+		/* Load modules */
+		load module = TrunSurv;
+		load module = CalCensor;
+		load module = ChangeKmSurv;
+		load module = CalTCost;
+		load module = CalOurMean;
+		load module = CalOurVar;
+		load module = CalOurCov;
+		load module = KmCal;
+
+		/* Read survival and cost data */
+		use &ds;
+			read  all var {id Delta surv totcost}; /*Subject ID, death indicator, survival time and total cost;*/
+		close &ds;
+
+		/* Define global variables */
+		n=nrow(id); /* number of subjects */
+		use L;
+			read all var{L};
+		close L;
+		rcost = &rcost.;
+
+		/* Truncate survival time to L, name the new variables tsurv and tDelta */
+		run TrunSurv(Delta, surv, tDelta, tsurv);
+
+		/* Make the largest observation a failure */
+		do i= 1 to n;
+			if (tsurv[i] = L) then tDelta[i]=1;
+		end;
+
+		/* Calculate the proportion of data that is Censored */
+		percens=CalCensor(tDelta);
+
+		/* Calculate the Kaplan Meier estimator for K(t)=Pr(C>t), name it kc */
+		run KmCal(tsurv, tDelta, kc);
+
+		/* Calculate the Kaplan Meier estimator for S(t)=Pr(C>t), name it s */
+		censor=j(n,1,0);
+
+		do i= 1 to n;
+			censor[i]=1-tDelta[i];
+		end;
+		run KmCal(tsurv, censor, s);
+
+		/* Calculate the total cost for each subject, needed for the simple weighted estimator */
+		run CalTCost(totcost, tcost, surv);
+
+		/* Calculate the mean using the simple weighted estimator */
+		mean_sw=CalOurMean(tDelta, kc, tcost);
+
+		/* Calculate the standard error of the simple weighted estimator */
+		var_sw=CalOurVar(tsurv, tDelta, s, kc, tcost, mean_sw);
+		se_sw=sqrt(var_sw);
+
+		/* Calculate the mean discounted survival time and its standard error*/
+		dsurv=j(n,1,0);
+
+		do i= 1 to n;
+			if &r. > 0 then
+				dsurv[i]=365.25/&r.*(1.0-exp(-&r.*tsurv[i]/365.25));
+			else dsurv[i]=tsurv[i];
+		end;
+
+		mean_T = CalOurMean(tDelta, kc, dsurv);
+		var_T = CalOurVar(tsurv, tDelta, s, kc, dsurv, mean_T);
+		se_T = sqrt(var_T);
+
+		/* Calculate the covariance between mean survival time and simple weighted cost estimator */
+		cov_sw = CalOurCov(tDelta, tsurv, s, kc, tcost, mean_sw, dsurv, mean_T);
+
+		table = round(n || percens || &r. || rcost || L || round(mean_T, 0.1) || se_T || round(mean_sw, 0.1) || se_sw || cov_sw, 0.01)`;
+		vars = {"Sample size", 
+                "Proportion of censoring", 
+				"Annual discounting rate for survival time (r)",
+				"Annual discounting rate for cost (rcost)", 
+				"Time limit (L), days",
+				"KM: Mean survival time", 
+				"KM: Standard error for the mean survival time", 
+				"BT: Simple weighted estimator for mean cost", 
+				"BT: Standard error estimate for the simple weighted estimator",
+				"BT: Covariance between mean survival time and mean cost"};
+		tbl = TableCreate("Statistics", vars);
+		call TableAddVar(tbl, {"Value"}, table);
+		call TablePrint(tbl) ID = "Statistics" label = "Output from BT macro for &ds dataset";
+	quit;
+%mend;
+
+data example1;
+  input id delta surv totcost;
+datalines;
+1 1 2 1
+2 0 2.1 10
+3 1 4 7
+4 0 4.1 5
+5 0 5 9
+6 1 6 8
+7 1 7 10
+;
+run;
+
+data example2; *we fixed ID=27's delta (0->1 to be consistent for ties);
+   input id delta surv_mo totcost;
+cards;
+1 0 2 41.67
+2 1 2 33.73
+3 0 4 78.97
+4 1 4 98.72
+5 0 5 93.58
+6 1 6 111.96
+7 0 7 137.16
+8 0 7 171.47
+9 1 7 130.30
+10 0 8 179.91
+11 0 8 195.47
+12 0 9 219.36
+13 0 10 194.10
+14 0 10 194.48
+15 1 10 243.13
+16 0 11 213.40
+17 1 11 266.78
+18 1 11 266.78
+19 1 13 338.33
+20 0 15 345.79
+21 1 15 273.72
+22 0 16 329.74
+23 0 18 360.37
+24 0 20 474.37
+25 0 21 516.75
+26 0 23 563.19
+27 1 26 522.79
+28 1 26 510.39
+29 1 36 524.06
+30 1 36 754.05
+;
+run;
+*see end of this program for more macro runs and CLV history (=CF) data;
+data example2; set example2;
+surv=surv_mo*30.4;
+run;
+
+data example3;
+  input id surv	delta cid totcost;
+datalines;
+1 1063.8 0 1 856
+2 1035.23 0 2 41655
+3 1778.15 0 3 33489
+4 846.59 0 4 2482
+5 379.65 1 5 5567
+6 710.23 0 6 3875
+7 1497.7 1 7 70985
+8 271.94 0 8 61519
+9 1314 1 9 84945
+10 1 0 10 5000
+11 559.76 0 11 44882
+12 1911.72 0 12 27665
+13 539.95 0 13 69572
+14 2029.66 0 14 0
+15 600.89 0 15 11646
+16 1875.71 0 16 48840
+17 474 0 17 678
+18 1836.83 0 18 50353
+19 742.08 0 19 1939
+20 1764.87 0 20 70891
+21 754.3 0 21 614
+22 1709.9 0 22 43928
+23 732.95 0 23 998
+24 296.18 1 24 5211
+25 1054.31 0 25 2214
+26 212.09 1 26 5256
+27 1203.38 0 27 17782
+28 116.8 1 28 5100
+29 1223.65 0 29 90027
+30 360.47 1 30 42466
+31 1228.86 0 31 63323
+32 837.73 0 32 448
+33 1630.6 0 33 1762
+34 1239.59 0 34 22698
+35 1612.41 0 35 53318
+36 1305.81 0 36 296
+37 1537.74 0 37 62609
+38 1295.44 0 38 23337
+39 1650.79 0 39 44336
+40 1380.53 0 40 78385
+41 1878.56 0 41 5395
+42 1325.32 1 42 43642
+43 2079.14 0 43 4541
+44 1100.88 1 44 8127
+45 289.14 0 45 683
+46 1181.63 1 46 66553
+47 203.81 0 47 45171
+48 936.84 1 48 19775
+49 647.33 0 49 43653
+50 261.57 1 50 84695
+51 692.97 0 51 64948
+52 1127.64 1 52 5199
+53 562.96 0 53 94332
+54 817.77 1 54 42701
+55 617.75 0 55 659
+56 426.17 1 56 7685
+57 566.13 0 57 57821
+58 361.84 1 58 38104
+59 431.01 0 59 30130
+60 332.31 1 60 5317
+61 764.93 0 61 47522
+62 671.04 1 62 73408
+63 769.01 0 63 68706
+64 693.1 1 64 40065
+65 1035.52 0 65 26863
+66 601.71 1 66 41963
+67 837.27 1 67 7600
+68 451.54 1 68 45435
+69 369.68 0 69 104617
+70 395.85 1 70 8432
+71 797.51 0 71 48213
+72 70.92 1 72 5870
+73 1975.3 1 73 75070
+74 56.82 1 74 27776
+75 2056.94 1 75 154871
+76 141.09 1 76 35765
+77 418.99 0 77 584
+78 14.94 1 78 44234
+79 473.8 0 79 44215
+80 1 1 80 5761
+81 1945.41 1 81 53758
+82 86.85 1 82 6167
+83 1894.41 0 83 13046
+84 261.69 1 84 6798
+85 1339.19 0 85 61652
+86 35.78 1 86 5489
+87 1965.54 0 87 62405
+88 1 1 88 7477
+89 2025.07 0 89 46407
+90 196.33 1 90 5941
+91 892.84 0 91 1808
+92 58.75 1 92 8739
+93 853.91 0 93 15253
+94 1 1 94 5896
+95 1576.28 0 95 28964
+96 1 1 96 5000
+97 1612.66 0 97 67754
+98 138.76 1 98 0
+99 1646.43 0 99 33098
+100 95.39 1 100 5738
+;
+run;
+
+******************************************* BT_ZT MACRO *********************************************************;
+
+%macro bt_zt(surv_ds, cost_ds, L, r = 0, rcost = 0);
+	title;
+	proc sort data = &surv_ds;
+		by id;
+	run;
+	proc sort data = &cost_ds;
+		by cid;
+	run;
+
+	/* Check for missing values */
+	data _null_;
+		set &surv_ds.;
+		if nmiss(id, surv, Delta) ne 0 then do;
+		put 'ERR' 'OR: Input data has missing value(s) - the processing is terminated.';
+		abort;
+		end;
+	run;
+	data _null_;
+		set &cost_ds.;
+		if nmiss(cid, start, stop, cost) ne 0 then do;
+		put 'ERR' 'OR: Input data has missing value(s) - the processing is terminated.';
+		abort;
+		end;
+	run;
+
+	%if %sysevalf(%superq(L)=,boolean) = 1 %then %do;
+		proc univariate data = &surv_ds. noprint;
+			var surv;
+			output out = L (rename = (L75 = L)) pctlpts = 75 pctlpre = L;
+		run;
+		data L;
+			set L;
+			L = round(L);
+			call symput('L', strip(L));
+		run;
+	%end;
+	%else %do;
+		proc sql noprint;
+			select max(surv) into :L_max trimmed 
+			from &surv_ds.;
+		quit;
+		%if %sysevalf(&L. > &L_max.,boolean) %then %do;
+			data err;
+				Warning= 'L = limit time, default is 75th percentile of followup time, and L > max(surv) is not allowed.';
+			run;
+			proc report data = err;
+				column Warning;
+				define Warning / display style={background=red};
+			run;
+			%put 'L = limit time, default is 75th percentile of followup time, and L > max(surv) is not allowed';
+			%abort;
+		%end;
+		%else %do;
+			data L;
+				L = round(&L);
+			run;
+		%end;
+	%end;
+
+	proc iml;
+		/* Load modules */
+		load module = TrunSurv;
+		load module = CalCensor;
+		load module = ChangeKmSurv;
+		load module = CalTCostZT;
+		load module = CalOurMean;
+		load module = CalOurVar;
+		load module = CalMeanAdd;
+		load module = CalCulCost;
+		load module = CalOurCov;
+		load module = CalCovSub;
+		load module = KmCal;
+
+		/* Read survival data */
+		use &surv_ds.;
+			read  all var {id Delta surv};
+
+		/*Subject ID, death indicator, and survival time;*/
+		close &surv_ds.;
+
+		/* Read cost data */
+		use &cost_ds.;
+			read  all var {cid start stop cost};
+
+		/* Subject ID, cost start date, stop date, cost incurred */
+		/*show names;*/
+		close &cost_ds.;
+
+		/* Define global variables */
+		n=nrow(id); /* number of subjects */
+		nobs=nrow(cid); /* total number of cost observations */
+		use L;
+			read all var{L};
+		close L;
+		rcost = &rcost.;
+
+		/* Truncate survival time to L, name the new variables tsurv and tDelta */
+		run TrunSurv(Delta, surv, tDelta, tsurv);
+
+		/* Make the largest observation a failure */
+		do i= 1 to n;
+			if (tsurv[i] = L) then tDelta[i]=1;
+		end;
+
+		/* Calculate the proportion of data that is censored */
+		percens=CalCensor(tDelta);
+
+		/* Calculate the Kaplan Meier estimator for K(t)=Pr(C>t), name it kc */
+		run KmCal(tsurv, tDelta, kc);
+
+		/* Calculate the Kaplan Meier estimator for S(t)=Pr(C>t), name it s */
+		censor=j(n,1,0);
+
+		do i= 1 to n;
+			censor[i]=1-tDelta[i];
+		end;
+		run KmCal(tsurv, censor, s);
+
+		/* Calculate the total cost for each subject, needed for the simple weighted estimator */
+		run CalTCostZT(cid, start, stop, cost, id, tsurv, tcost);
+
+		/* Calculate the mean using the simple weighted estimator */
+		mean_sw=CalOurMean(tDelta, kc, tcost);
+
+		/* Calculate the standard error of the simple weighted estimator */
+		var_sw=CalOurVar(tsurv, tDelta, s, kc, tcost, mean_sw);
+		se_sw=sqrt(var_sw);
+
+		/* Calculate the mean discounted survival time and its standard error*/
+		dsurv=j(n,1,0);
+
+		do i= 1 to n;
+			if &r. > 0 then
+				dsurv[i]=365.25/&r.*(1.0-exp(-&r.*tsurv[i]/365.25));
+			else dsurv[i]=tsurv[i];
+		end;
+
+		mean_T = CalOurMean(tDelta, kc, dsurv);
+		var_T = CalOurVar(tsurv, tDelta, s, kc, dsurv, mean_T);
+		se_T = sqrt(var_T);
+
+		/* Calculate cumulative cost at each censored time, needed for the improved estimator */
+		run CalCulCost(cid, start, stop, cost, id, tsurv, tDelta, culcost);
+
+		/* Calculate improved estimator and its standard error*/
+		run CalMeanAdd(tsurv, tDelta, kc, s, tcost, culcost, meanadd, varsub);
+
+		mean_imp = mean_sw+meanadd;
+		/* Calculate the 1st term in var_imp has mean_imp instead of mean_sw */
+	    var_sw1=CalOurVar(tsurv, tDelta, s, kc, tcost, mean_imp);
+		se_sw1=sqrt(var_sw1);
+		se_imp = sqrt(var_sw1-varsub);
+
+		/* Calculate the covariance between mean survival time and simple weighted cost estimator */
+		cov_sw = CalOurCov(tDelta, tsurv, s, kc, tcost, mean_sw, dsurv, mean_T);
+
+		/* Calculate the covariance between mean survival time and improved cost estimator */
+		covsub=CalCovSub(tDelta, tsurv, s, kc, culcost, dsurv);
+		cov_imp=cov_sw-covsub;
+
+		table = round(n || percens || &r. || rcost || L || round(mean_T, 0.1) || se_T || mean_sw || se_sw || round(mean_imp, 0.1) || se_imp || cov_sw || cov_imp, 0.01)`;
+		vars = {"Sample size", 
+            "Proportion of censoring", 
+		    "Annual discounting rate for survival time (r)",
+			"Annual discounting rate for cost (rcost)", 
+			"Time limit (L), days",
+			"KM: Mean survival time", 
+			"KM: Standard error for the mean survival time",
+			"BT: Simple weighted estimator for mean cost", 
+			"BT: Standard error estimate for the simple weighted estimator",
+			"ZT: Improved estimator for mean cost",
+			"ZT: Standard error of the improved estimator",
+			"BT: Covariance between mean survival time and the simple weighted cost estimator",
+			"ZT: Covariance between mean survival time and the improved cost estimator"};
+		tbl = TableCreate("Statistics", vars);
+		call TableAddVar(tbl, {"Value"}, table);
+		call TablePrint(tbl) ID = "Statistics" label = "Output from BT_ZT macro for &surv_ds. and &cost_ds. datasets";
+	quit;
+%mend;
+
+data synth_surv;
+	input id surv delta;
+datalines;
+1 1063.8 0
+2 1035.23 0
+3 1778.15 0
+4 846.59 0
+5 379.65 1
+6 710.23 0
+7 1497.7 1
+8 271.94 0
+9 1314 1
+10 1 0
+11 559.76 0
+12 1911.72 0
+13 539.95 0
+14 2029.66 0
+15 600.89 0
+16 1875.71 0
+17 474 0
+18 1836.83 0
+19 742.08 0
+20 1764.87 0
+21 754.3 0
+22 1709.9 0
+23 732.95 0
+24 296.18 1
+25 1054.31 0
+26 212.09 1
+27 1203.38 0
+28 116.8 1
+29 1223.65 0
+30 360.47 1
+31 1228.86 0
+32 837.73 0
+33 1630.6 0
+34 1239.59 0
+35 1612.41 0
+36 1305.81 0
+37 1537.74 0
+38 1295.44 0
+39 1650.79 0
+40 1380.53 0
+41 1878.56 0
+42 1325.32 1
+43 2079.14 0
+44 1100.88 1
+45 289.14 0
+46 1181.63 1
+47 203.81 0
+48 936.84 1
+49 647.33 0
+50 261.57 1
+51 692.97 0
+52 1127.64 1
+53 562.96 0
+54 817.77 1
+55 617.75 0
+56 426.17 1
+57 566.13 0
+58 361.84 1
+59 431.01 0
+60 332.31 1
+61 764.93 0
+62 671.04 1
+63 769.01 0
+64 693.1 1
+65 1035.52 0
+66 601.71 1
+67 837.27 1
+68 451.54 1
+69 369.68 0
+70 395.85 1
+71 797.51 0
+72 70.92 1
+73 1975.3 1
+74 56.82 1
+75 2056.94 1
+76 141.09 1
+77 418.99 0
+78 14.94 1
+79 473.8 0
+80 1 1
+81 1945.41 1
+82 86.85 1
+83 1894.41 0
+84 261.69 1
+85 1339.19 0
+86 35.78 1
+87 1965.54 0
+88 1 1
+89 2025.07 0
+90 196.33 1
+91 892.84 0
+92 58.75 1
+93 853.91 0
+94 1 1
+95 1576.28 0
+96 1 1
+97 1612.66 0
+98 138.76 1
+99 1646.43 0
+100 95.39 1
+;
+run;
+
+data synth_cost;
+	input cid start stop cost;
+datalines;
+1 1 1054 132
+1 22 1054 159
+1 99 1052 10
+1 99 1052 7
+1 99 1052 6
+1 99 1053 15
+1 99 1053 41
+1 99 1053 3
+1 99 1054 14
+1 105 1052 52
+1 183 1053 34
+1 272 1053 79
+1 334 1054 79
+1 593 1049 34
+1 593 1053 15
+1 593 1053 6
+1 593 1055 11
+1 596 1054 159
+2 0 1024 39527
+2 1 1022 462
+2 1 1024 946
+2 1 1025 105
+2 286 1024 15
+2 321 1024 3
+2 321 1025 15
+2 321 1025 13
+2 321 1025 15
+2 341 1022 61
+2 483 1026 132
+2 494 1024 15
+2 494 1024 13
+2 494 1024 15
+2 637 1023 318
+3 1 577 287
+3 2 830 504
+3 106 111 31182
+3 134 190 79
+3 211 212 8
+3 211 212 7
+3 398 830 205
+3 398 830 735
+3 416 417 34
+3 485 575 79
+3 485 486 7
+3 515 516 7
+3 546 547 3
+3 546 547 7
+3 578 643 132
+3 579 830 63
+3 607 608 7
+3 642 643 3
+3 642 643 7
+3 646 699 79
+3 665 666 7
+3 697 698 3
+3 697 698 7
+3 729 730 3
+3 794 1776 34
+4 1 443 220
+4 39 40 3
+4 39 40 7
+4 48 49 38
+4 80 166 264
+4 98 99 3
+4 98 99 7
+4 178 443 152
+4 194 195 41
+4 194 195 34
+4 194 195 3
+4 194 195 11
+4 194 195 6
+4 194 195 10
+4 194 195 8
+4 246 390 929
+4 393 443 725
+4 433 434 14
+4 436 845 7
+5 27 369 238
+5 101 368 301
+5 295 368 3
+5 295 369 10
+5 295 370 5015
+6 1 163 15
+6 12 430 1329
+6 15 271 940
+6 37 98 184
+6 97 98 818
+6 101 209 132
+6 165 300 22
+6 238 239 49
+6 273 430 215
+6 302 430 12
+6 345 708 159
+7 0 10 53266
+7 0 850 148
+7 1 981 1534
+7 1 981 18
+7 10 11 5332
+7 31 981 152
+7 31 981 275
+7 33 34 1376
+7 81 82 23
+7 81 82 15
+7 153 981 1624
+7 177 178 15
+7 183 276 159
+7 219 220 34
+7 282 283 11
+7 345 346 34
+7 403 404 34
+7 461 537 238
+7 725 726 3
+7 744 745 8
+7 792 981 796
+7 852 981 367
+7 853 915 238
+7 911 912 34
+7 918 981 211
+7 971 972 3
+7 971 972 14
+7 974 1496 5023
+8 1 33 79
+8 8 30 29533
+8 36 74 238
+8 49 50 251
+8 73 74 15
+8 73 74 7
+8 102 105 25526
+8 107 108 3
+8 112 113 3
+8 138 139 7
+8 169 170 3
+8 187 188 7
+8 202 203 5462
+8 200 201 52
+8 224 225 3
+8 224 225 7
+8 224 225 9
+8 231 232 41
+8 231 232 3
+8 261 262 15
+8 263 264 118
+8 264 265 3
+8 264 265 15
+8 267 268 109
+8 268 269 3
+8 268 270 7
+9 0 20 57300
+9 1 121 20
+9 1 133 195
+9 19 26 21
+9 21 22 430
+9 62 244 13
+9 105 106 38
+9 105 106 34
+9 136 152 21
+9 147 148 3
+9 147 148 15
+9 154 155 3
+9 154 155 7
+9 154 155 10
+9 173 174 3
+9 173 174 8
+9 173 174 15
+9 208 209 3
+9 208 209 15
+9 208 209 7
+9 211 212 391
+9 217 218 3
+9 217 218 7
+9 239 240 15
+9 239 240 7
+9 244 245 3
+9 281 282 3
+9 281 282 7
+9 281 282 10
+9 288 365 370
+9 287 288 41
+9 287 288 391
+9 313 314 10
+9 336 340 5831
+9 342 343 13721
+9 363 364 3
+9 363 364 15
+9 363 364 7
+9 389 390 3
+9 389 390 7
+9 421 422 10
+9 455 456 7
+9 461 462 46
+9 465 525 211
+9 483 484 15
+9 488 1012 125
+9 519 609 197
+9 536 537 15
+9 606 607 10
+9 612 1012 9
+9 636 637 3
+9 636 637 11
+9 636 637 15
+9 636 637 7
+9 697 698 33
+9 774 839 211
+9 838 839 7
+9 976 1312 5007
+10 0 0 5000
+11 0 7 43940
+11 1 261 380
+11 39 40 34
+11 76 77 34
+11 147 148 3
+11 147 148 16
+11 147 148 15
+11 195 196 9
+11 252 253 34
+11 337 462 79
+11 465 533 238
+11 466 467 3
+11 466 467 6
+11 466 467 7
+11 466 467 15
+11 466 467 35
+11 518 558 34
+12 1 12 2
+12 1 26 320
+12 1 868 78
+12 29 82 320
+12 170 229 168
+12 384 915 316
+12 735 736 38
+12 735 736 3
+12 735 736 11
+12 735 736 15
+12 741 843 149
+12 846 887 149
+12 890 1025 332
+12 898 899 79
+12 917 1221 954
+12 917 1238 97
+12 933 934 38
+12 933 934 3
+12 933 934 11
+12 942 943 190
+12 1020 1021 38
+12 1020 1021 11
+12 1020 1021 15
+12 1028 1120 290
+12 1027 1028 38
+12 1027 1028 3
+12 1038 1039 9
+12 1048 1053 4886
+12 1062 1063 31
+12 1076 1077 31
+12 1076 1077 3
+12 1085 1090 4379
+12 1094 1095 31
+12 1152 1153 31
+12 1159 1238 407
+12 1174 1238 25
+12 1177 1178 38
+12 1181 1194 11966
+12 1195 1196 38
+12 1195 1196 3
+12 1195 1196 14
+12 1195 1196 15
+12 1201 1202 31
+12 1201 1202 14
+12 1205 1220 54
+12 1205 1238 337
+12 1208 1209 3
+12 1218 1219 185
+12 1218 1219 3
+12 1237 1238 1
+12 1240 1910 1462
+13 0 11 68780
+13 1 85 25
+13 1 391 112
+13 39 117 196
+13 280 281 34
+13 284 362 129
+13 365 470 264
+13 415 416 3
+13 415 416 7
+13 510 511 3
+13 510 511 7
+13 513 538 12
+14 0 3 0
+14 1 74 0
+14 55 56 0
+14 55 56 0
+14 219 2028 0
+15 0 0 11229
+15 1 29 105
+15 32 95 105
+15 97 599 207
+16 1 142 125
+16 1 644 103
+16 1 1641 301
+16 20 26 32617
+16 23 103 272
+16 102 103 31
+16 106 173 272
+16 176 285 75
+16 288 356 197
+16 318 319 285
+16 320 321 7
+16 320 321 15
+16 599 1641 909
+16 643 644 0
+16 646 1085 71
+16 710 847 342
+16 714 715 190
+16 714 715 3
+16 714 715 7
+16 815 816 2892
+16 847 848 31
+16 850 875 123
+16 878 987 123
+16 938 939 3
+16 938 939 14
+16 990 1127 481
+16 1029 1030 38
+16 1063 1065 1710
+16 1071 1072 31
+16 1078 1082 4636
+16 1093 1641 1693
+16 1130 1212 75
+16 1173 1174 71
+16 1215 1253 522
+16 1256 1358 373
+16 1357 1358 31
+16 1360 1641 5
+16 1386 1387 16
+16 1406 1641 7
+16 1519 1520 14
+16 1519 1520 23
+16 1567 1568 31
+16 1571 1874 75
+17 20 315 264
+17 172 173 34
+17 179 296 79
+17 299 358 238
+17 323 324 3
+17 323 324 11
+17 323 324 23
+17 393 394 3
+17 396 472 23
+18 1 34 75
+18 1 173 211
+18 1 449 915
+18 1 1267 2063
+18 1 1267 2334
+18 33 34 149
+18 33 34 180
+18 37 89 149
+18 115 116 3
+18 115 116 6
+18 176 683 924
+18 179 289 149
+18 288 289 190
+18 288 289 15
+18 292 360 123
+18 292 1267 1062
+18 318 319 3
+18 363 1267 331
+18 367 368 9
+18 374 375 31
+18 374 375 3
+18 388 389 31
+18 388 389 16
+18 388 389 20
+18 388 389 15
+18 447 452 9144
+18 448 451 0
+18 454 683 183
+18 570 571 3
+18 570 571 16
+18 576 604 75
+18 603 604 2
+18 646 1267 17
+18 675 676 19
+18 675 676 23
+18 678 683 29410
+18 685 1267 415
+18 696 697 48
+18 753 754 31
+18 753 754 30
+18 753 754 6
+18 833 834 48
+18 837 888 75
+18 843 844 31
+18 887 888 3
+18 887 888 14
+18 891 970 448
+18 889 890 48
+18 934 935 3
+18 934 935 15
+18 934 935 6
+18 969 970 4
+18 969 970 19
+18 973 1069 448
+18 997 998 3
+18 997 998 6
+18 997 998 20
+18 1046 1047 31
+18 1049 1267 67
+18 1072 1173 448
+18 1109 1110 3
+18 1109 1110 15
+18 1116 1117 31
+18 1116 1117 14
+18 1172 1173 6
+18 1235 1236 3
+18 1235 1236 14
+18 1235 1236 23
+18 1235 1236 38
+18 1235 1236 10
+18 1266 1267 4
+18 1269 1835 26
+19 1 23 238
+19 1 60 9
+19 14 15 7
+19 26 84 318
+19 46 47 7
+19 62 180 205
+19 81 82 7
+19 81 82 15
+19 87 198 397
+19 182 333 21
+19 182 333 25
+19 201 296 289
+19 210 222 239
+19 335 400 98
+19 335 400 12
+19 403 740 52
+20 0 8 57135
+20 0 410 583
+20 1 22 37
+20 1 22 17
+20 7 8 1548
+20 49 230 142
+20 69 410 81
+20 69 410 864
+20 109 110 14
+20 109 110 15
+20 138 139 3
+20 138 139 14
+20 147 147 1820
+20 173 174 3
+20 173 174 14
+20 173 174 15
+20 179 180 190
+20 224 229 7702
+20 232 410 153
+20 262 263 3
+20 262 263 15
+20 275 343 440
+20 299 300 7
+20 327 328 14
+20 327 328 7
+20 327 328 9
+20 359 360 14
+20 383 384 3
+20 383 384 14
+20 386 1763 15
+21 1 38 184
+21 1 44 44
+21 79 80 4
+21 82 228 108
+21 272 273 11
+21 321 507 45
+21 363 438 184
+21 659 752 34
+22 0 1036 42
+22 1 22 149
+22 1 39 43
+22 1 39 49
+22 5 5 34451
+22 15 16 3
+22 15 16 14
+22 15 16 23
+22 15 16 15
+22 25 67 123
+22 64 65 3
+22 151 152 7
+22 178 1036 28
+22 196 263 123
+22 220 221 2591
+22 222 1036 297
+22 235 236 3
+22 235 236 7
+22 266 389 123
+22 267 268 3
+22 385 386 3
+22 392 452 219
+22 419 420 3
+22 419 420 7
+22 448 449 3
+22 478 479 3
+22 507 508 3
+22 540 541 3
+22 540 541 7
+22 563 564 3
+22 563 564 7
+22 575 642 395
+22 595 596 7
+22 623 624 3
+22 623 624 7
+22 641 642 543
+22 644 645 3
+22 644 645 7
+22 704 705 523
+22 708 845 566
+22 707 708 3
+22 731 732 31
+22 752 753 31
+22 781 782 3
+22 781 782 7
+22 816 817 7
+22 841 842 31
+22 844 845 1163
+22 844 845 3
+22 844 845 7
+22 904 905 3
+22 907 908 523
+22 911 978 395
+22 932 933 3
+22 977 978 582
+22 977 978 3
+22 981 1036 246
+22 998 999 3
+22 1029 1030 7
+22 1038 1708 465
+23 1 2 13
+23 20 89 79
+23 92 178 132
+23 131 132 52
+23 252 348 211
+23 315 316 3
+23 315 316 30
+23 410 411 52
+23 446 570 236
+23 466 467 52
+23 540 541 52
+23 619 620 34
+23 683 731 52
+24 178 179 31
+24 182 265 149
+24 267 294 5031
+25 1 1044 238
+25 30 1042 318
+25 252 1044 159
+25 363 1044 238
+25 425 1045 34
+25 483 1045 79
+25 559 1043 211
+25 652 1043 159
+25 691 1045 254
+25 700 1043 283
+25 730 1044 3
+25 820 1044 159
+25 937 1046 79
+26 1 132 155
+26 1 168 69
+26 117 118 6
+26 117 118 20
+26 209 210 5006
+27 1 38 1309
+27 1 248 17
+27 1 673 566
+27 8 948 795
+27 41 88 2176
+27 193 277 2760
+27 250 948 980
+27 280 365 2618
+27 333 334 251
+27 382 383 378
+27 462 568 1637
+27 505 506 207
+27 582 583 23
+27 590 591 3
+27 590 591 11
+27 590 591 4
+27 617 618 381
+27 633 634 3
+27 665 734 318
+27 675 857 26
+27 689 690 34
+27 689 690 3
+27 689 690 10
+27 733 734 52
+27 733 734 10
+27 737 819 830
+27 770 771 15
+27 806 807 3
+27 815 816 15
+27 819 820 3
+27 822 910 874
+27 828 948 103
+27 833 834 3
+27 844 845 3
+27 844 845 15
+27 897 898 9
+27 913 914 34
+27 913 914 95
+27 913 914 3
+27 913 914 7
+27 941 942 15
+27 941 942 7
+27 980 981 7
+27 988 989 34
+27 996 997 140
+27 1029 1030 3
+27 1029 1030 7
+27 1031 1032 15
+27 1050 1051 7
+27 1078 1079 3
+27 1078 1079 10
+27 1091 1180 880
+27 1099 1100 3
+27 1099 1100 10
+27 1136 1137 3
+27 1177 1178 41
+27 1177 1178 3
+27 1180 1201 10
+28 1 3 13
+28 1 3 0
+28 1 40 12
+28 37 110 55
+28 107 108 3
+28 107 108 5
+28 110 115 5012
+29 0 32 65660
+29 45 799 185
+29 279 365 79
+29 368 479 238
+29 381 382 3
+29 381 382 7
+29 449 450 34
+29 449 450 3
+29 449 450 7
+29 548 549 7
+29 639 640 10
+29 723 724 34
+29 796 797 3
+29 796 797 10
+29 802 898 238
+29 827 828 34
+29 827 828 3
+29 925 926 10
+29 968 969 7
+29 968 969 10
+29 996 997 7
+29 996 997 10
+29 999 1088 211
+29 1041 1042 3
+29 1041 1042 7
+29 1082 1083 10
+29 1131 1132 3
+29 1131 1132 10
+29 1161 1162 7
+29 1194 1195 16
+29 1194 1195 6
+29 1201 1222 23155
+30 0 349 35863
+30 12 350 1369
+30 12 350 14
+30 12 350 15
+30 12 351 3
+30 17 350 50
+30 28 349 3
+30 33 350 5149
+31 0 9 39479
+31 1 38 238
+31 16 180 83
+31 16 467 73
+31 18 19 3
+31 41 62 318
+31 65 180 397
+31 72 73 3
+31 152 467 79
+31 183 271 397
+31 194 195 3
+31 194 195 7
+31 194 195 10
+31 251 252 3518
+31 347 348 3
+31 347 348 11
+31 347 348 15
+31 370 467 238
+31 407 408 3
+31 407 408 7
+31 462 1227 18438
+32 36 85 30
+32 37 85 63
+32 87 126 26
+32 101 167 33
+32 169 170 5
+32 576 607 126
+32 610 741 126
+32 744 836 39
+33 1 38 137
+33 1 233 67
+33 54 55 1008
+33 59 181 135
+33 184 233 367
+33 216 217 8
+33 219 1629 40
+34 1 42 228
+34 7 98 236
+34 101 199 126
+34 202 257 63
+34 566 585 25
+34 566 769 202
+34 693 698 1
+34 697 698 218
+34 759 769 12
+34 772 860 165
+34 1052 1138 165
+34 1175 1175 19616
+34 1226 1238 1641
+35 0 9 42478
+35 1 14 3
+35 1 68 11
+35 1 438 65
+35 1 438 129
+35 1 438 750
+35 1 438 18
+35 1 438 45
+35 16 68 85
+35 45 83 173
+35 70 438 960
+35 118 119 11
+35 198 258 131
+35 261 386 197
+35 310 438 41
+35 324 328 8161
+35 376 377 10
+35 380 438 14
+35 379 380 33
+35 380 381 3
+35 440 1610 0
+36 9 275 5
+36 43 102 63
+36 105 168 102
+36 259 1304 126
+37 0 15 61374
+37 1 598 733
+37 1 598 220
+37 18 62 69
+37 70 82 7
+37 365 425 136
+37 520 1536 70
+38 1 7 4
+38 1 7 2
+38 1 7 3
+38 1 431 1572
+38 1 431 159
+38 9 145 80
+38 9 173 729
+38 9 225 19
+38 61 62 186
+38 76 173 237
+38 112 309 63
+38 156 157 8
+38 156 157 7
+38 156 157 15
+38 159 160 27
+38 159 160 8
+38 164 165 3
+38 164 165 8
+38 204 205 3
+38 204 205 6
+38 204 205 30
+38 204 205 15
+38 243 244 3
+38 243 244 27
+38 249 343 230
+38 253 254 15
+38 271 275 6435
+38 274 282 83
+38 312 343 9
+38 310 311 2977
+38 310 311 256
+38 310 311 315
+38 310 311 71
+38 310 311 638
+38 352 353 672
+38 352 353 63
+38 352 353 164
+38 386 387 68
+38 387 388 3
+38 387 388 27
+38 387 388 7
+38 430 431 448
+38 430 431 2064
+38 433 484 17
+38 433 486 57
+38 433 488 35
+38 433 488 7
+38 433 488 12
+38 434 488 270
+38 485 488 5162
+38 483 485 6
+38 486 486 1
+38 487 488 1
+38 488 488 9
+38 486 487 0
+38 490 1293 1
+39 0 7 33335
+39 1 28 14
+39 1 240 6
+39 30 31 4133
+39 30 116 116
+39 32 629 11
+39 38 116 40
+39 42 43 3
+39 45 46 3
+39 45 46 6
+39 72 73 350
+39 72 73 1413
+39 90 91 435
+39 115 115 2365
+39 235 301 65
+39 260 261 6
+39 300 301 6
+39 303 402 14
+39 303 468 129
+39 322 323 28
+39 431 522 181
+39 495 497 1136
+39 533 534 3
+39 533 534 6
+39 549 629 222
+39 549 629 62
+39 549 629 10
+39 564 565 3
+39 601 602 6
+39 606 629 206
+39 608 1649 23
+40 0 12 64114
+40 1 91 55
+40 1 112 86
+40 1 148 56
+40 47 91 236
+40 47 148 80
+40 47 148 17
+40 71 72 3
+40 71 72 20
+40 71 72 7
+40 71 72 7
+40 94 178 595
+40 94 208 69
+40 100 101 3
+40 125 126 46
+40 151 208 69
+40 151 208 30
+40 151 208 5
+40 151 208 46
+40 151 208 11
+40 177 178 100
+40 192 193 3
+40 203 1379 12727
+41 18 1877 5395
+42 0 2 35799
+42 1 33 5
+42 1 33 26
+42 1 431 125
+42 1 913 146
+42 1 913 16
+42 13 14 33
+42 35 913 667
+42 66 67 13
+42 74 218 541
+42 78 114 78
+42 205 212 6
+42 205 212 8
+42 217 218 31
+42 221 280 196
+42 281 560 52
+42 279 280 34
+42 283 365 131
+42 368 446 131
+42 430 431 3
+42 430 431 13
+42 430 431 9
+42 448 448 2
+42 449 560 262
+42 451 452 15
+42 454 464 34
+42 760 761 13
+42 760 761 15
+42 794 1323 5238
+43 1 39 224
+43 1 219 156
+43 1 407 228
+43 1 407 513
+43 4 407 101
+43 206 207 2660
+43 249 250 7
+43 252 333 493
+43 276 277 3
+43 276 277 7
+43 336 2077 149
+44 18 648 887
+44 36 44 78
+44 56 311 252
+44 70 71 3
+44 70 71 10
+44 70 71 15
+44 103 189 65
+44 191 381 89
+44 273 293 36
+44 273 648 92
+44 298 365 131
+44 316 317 3
+44 316 317 13
+44 336 365 68
+44 337 648 307
+44 368 425 327
+44 414 648 90
+44 423 648 248
+44 428 532 133
+44 535 628 196
+44 543 544 10
+44 546 648 9
+44 631 1099 5065
+45 1 278 149
+45 2 278 40
+45 4 278 21
+45 4 278 14
+45 4 279 11
+45 23 277 129
+45 162 278 298
+45 214 278 21
+46 0 17 58881
+46 0 396 576
+46 1 41 397
+46 53 193 35
+46 83 199 370
+46 85 86 7
+46 99 100 34
+46 99 100 7
+46 102 380 417
+46 107 108 3
+46 107 108 7
+46 136 137 3
+46 136 137 7
+46 142 143 7
+46 149 150 3
+46 195 242 12
+46 202 262 238
+46 234 235 3
+46 241 242 0
+46 262 263 3
+46 276 277 3
+46 283 284 3
+46 283 284 7
+46 332 333 3
+46 339 340 7
+46 346 347 3
+46 360 361 3
+46 367 368 7
+46 374 375 3
+46 384 444 318
+46 382 383 3
+46 382 383 7
+46 409 410 7
+46 423 424 7
+46 487 488 3
+46 487 488 7
+46 508 509 3
+46 508 509 7
+46 550 551 7
+46 576 577 7
+46 599 600 7
+46 662 663 7
+46 689 690 3
+46 689 690 7
+46 718 719 3
+46 746 747 3
+46 760 761 3
+46 760 761 7
+46 774 775 10
+46 788 789 3
+46 809 810 3
+46 837 838 3
+46 859 860 7
+46 880 881 3
+46 901 902 3
+46 901 902 7
+46 927 928 3
+46 927 928 7
+46 976 977 3
+46 976 977 7
+46 998 999 3
+46 1019 1020 3
+46 1082 1083 3
+46 1103 1104 7
+46 1124 1125 3
+46 1166 1167 3
+46 1169 1180 5007
+47 0 6 44148
+47 1 41 197
+47 1 65 1
+47 91 202 825
+48 1 122 225
+48 1 249 465
+48 1 685 625
+48 18 19 34
+48 77 200 504
+48 202 685 88
+48 203 256 459
+48 252 613 90
+48 259 389 326
+48 392 452 318
+48 455 523 159
+48 526 648 397
+48 615 685 36
+48 651 718 397
+48 716 717 11
+48 737 738 3
+48 887 935 15638
+49 0 5 35210
+49 1 507 81
+49 14 15 222
+49 18 20 2920
+49 39 107 495
+49 42 43 7
+49 56 57 11
+49 71 72 3
+49 71 72 27
+49 71 72 6
+49 71 72 11
+49 71 72 7
+49 76 109 122
+49 92 93 8
+49 92 93 11
+49 92 93 7
+49 110 204 362
+49 137 138 11
+49 137 138 7
+49 207 260 259
+49 214 215 223
+49 231 232 7
+49 231 232 11
+49 252 253 3
+49 252 253 8
+49 252 253 10
+49 252 253 7
+49 252 254 2
+49 263 339 278
+49 294 295 3
+49 315 510 93
+49 315 644 98
+49 320 391 186
+49 325 326 11
+49 353 354 3
+49 353 354 11
+49 353 355 2
+49 356 359 1
+49 360 361 546
+49 374 376 79
+49 395 396 3
+49 416 417 8
+49 416 417 27
+49 416 417 11
+49 419 422 1
+49 435 436 3
+49 464 465 383
+49 465 466 11
+49 468 468 68
+49 468 644 102
+49 477 478 482
+49 486 487 3
+49 509 644 12
+49 512 644 148
+49 542 544 45
+49 545 548 1
+49 564 565 3
+49 564 566 45
+49 567 570 1
+49 567 568 715
+49 585 586 3
+49 585 586 8
+49 585 586 11
+49 585 587 45
+49 613 615 45
+49 616 619 1
+49 633 634 93
+49 643 645 6
+50 0 12 79028
+50 0 36 18
+50 15 74 93
+50 86 260 5556
+51 0 8 44353
+51 1 37 175
+51 13 14 788
+51 40 109 193
+51 112 183 151
+51 112 411 458
+51 137 139 6195
+51 186 292 109
+51 288 288 2034
+51 351 352 8
+51 351 352 6
+51 395 397 5211
+51 400 401 3
+51 548 626 109
+51 629 691 5155
+52 1 29 65
+52 1 116 22
+52 26 27 8
+52 32 1126 5104
+53 0 12 52399
+53 1 5 5
+53 1 24 135
+53 7 42 18
+53 13 42 58
+53 14 54 1
+53 23 24 156
+53 26 89 17
+53 39 165 89
+53 44 165 150
+53 55 56 3
+53 55 56 6
+53 62 63 3
+53 67 74 5885
+53 75 244 6
+53 79 80 6
+53 87 194 335
+53 86 87 3
+53 100 101 3
+53 100 101 11
+53 100 101 8
+53 100 101 6
+53 100 101 6
+53 114 115 6
+53 114 115 6
+53 117 118 166
+53 121 122 16
+53 121 122 6
+53 136 137 3
+53 136 137 6
+53 146 155 7024
+53 167 320 167
+53 167 320 23
+53 167 320 22
+53 176 186 21653
+53 188 189 8
+53 188 189 6
+53 188 189 6
+53 205 206 3
+53 205 206 11
+53 205 206 6
+53 205 206 6
+53 219 220 32
+53 219 220 3
+53 291 292 11
+53 291 292 6
+53 291 292 6
+53 304 305 8
+53 320 328 5252
+53 338 339 11
+53 338 339 6
+53 349 438 401
+53 366 367 11
+53 366 367 8
+53 366 367 6
+53 373 374 3
+53 388 389 6
+53 396 397 11
+53 396 397 8
+53 396 397 6
+53 415 416 3
+53 415 416 6
+53 447 448 6
+53 450 451 3
+53 450 451 6
+53 453 454 3
+53 461 462 3
+53 468 469 6
+53 475 476 3
+53 475 476 6
+53 475 476 6
+53 485 486 6
+53 523 524 6
+53 531 532 3
+53 531 532 6
+53 538 539 3
+53 555 556 3
+53 558 561 6
+54 0 4 37241
+54 1 9 65
+54 1 50 17
+54 1 50 60
+54 1 50 56
+54 1 50 104
+54 15 16 1
+54 19 50 102
+54 49 50 9
+54 52 816 5046
+55 1 134 92
+55 4 5 27
+55 61 62 3
+55 61 62 8
+55 106 521 121
+55 168 291 151
+55 191 192 14
+55 294 417 151
+55 520 521 32
+55 520 521 27
+55 520 521 14
+55 523 616 19
+56 0 0 102
+56 0 31 33
+56 1 89 8
+56 6 46 21
+56 20 22 11
+56 34 89 258
+56 45 46 3
+56 48 60 5
+56 59 60 3
+56 62 63 1
+56 65 102 3
+56 73 74 3
+56 88 89 3
+56 91 115 51
+56 92 166 216
+56 93 152 16
+56 101 102 7
+56 108 109 401
+56 117 145 67
+56 144 145 234
+56 144 145 109
+56 147 151 0
+56 147 368 297
+56 151 152 3
+56 151 152 7
+56 158 159 3
+56 158 159 6
+56 158 159 38
+56 161 165 2
+56 168 368 199
+56 169 270 354
+56 171 172 7
+56 174 200 5
+56 176 200 7
+56 199 200 81
+56 206 207 3
+56 246 247 3
+56 246 247 7
+56 273 424 5108
+57 0 4 53704
+57 1 27 193
+57 1 85 43
+57 1 226 42
+57 1 493 751
+57 1 493 45
+57 6 7 4
+57 6 7 2
+57 30 117 66
+57 31 32 7
+57 52 53 3
+57 52 53 7
+57 80 81 7
+57 87 226 69
+57 94 95 3
+57 94 95 7
+57 115 116 3
+57 115 116 7
+57 119 493 533
+57 122 123 3
+57 125 126 3
+57 125 126 6
+57 136 137 3
+57 150 151 7
+57 164 165 6
+57 178 179 3
+57 178 179 6
+57 199 200 6
+57 199 200 7
+57 244 257 8
+57 259 493 71
+57 262 263 3
+57 262 263 6
+57 262 263 7
+57 301 389 66
+57 322 323 3
+57 322 323 7
+57 350 351 3
+57 385 386 7
+57 392 419 133
+57 421 493 47
+57 433 433 1901
+57 441 442 3
+57 441 442 7
+57 469 470 3
+57 495 564 0
+58 0 2 32289
+58 1 32 359
+58 4 5 2
+58 11 48 5
+58 34 59 160
+58 40 86 10
+58 38 39 16
+58 38 39 11
+58 51 52 3
+58 51 52 7
+58 88 198 40
+58 145 146 7
+58 210 307 150
+58 226 227 7
+58 319 320 7
+58 330 360 5031
+59 0 2 29094
+59 1 31 113
+59 1 261 0
+59 1 261 130
+59 8 9 7
+59 15 16 7
+59 18 30 87
+59 29 30 3
+59 29 30 7
+59 34 101 157
+59 43 44 3
+59 50 51 3
+59 50 51 7
+59 57 58 7
+59 63 64 165
+59 64 65 3
+59 64 65 7
+59 71 72 7
+59 79 80 7
+59 99 100 3
+59 106 107 3
+59 106 107 7
+59 114 115 7
+59 127 128 3
+59 134 135 3
+59 134 135 7
+59 141 142 3
+59 155 156 3
+59 155 156 7
+59 162 163 3
+59 162 163 7
+59 169 170 7
+59 180 181 3
+59 180 181 7
+59 183 184 3
+59 190 191 3
+59 190 191 7
+59 204 205 3
+59 218 219 38
+59 218 219 31
+59 218 219 3
+59 218 219 7
+59 220 221 27
+59 225 226 3
+59 232 233 7
+59 253 254 3
+59 260 261 3
+59 260 261 7
+59 267 268 3
+59 274 275 3
+59 281 282 3
+59 290 291 3
+59 290 291 7
+59 297 298 7
+59 304 305 7
+59 311 312 7
+59 318 319 7
+59 332 333 7
+59 339 340 3
+59 339 340 7
+59 346 347 7
+59 353 354 7
+59 374 375 3
+59 381 382 3
+59 388 389 7
+59 405 429 7
+60 2 3 5
+60 18 47 16
+60 46 47 7
+60 60 61 119
+60 60 61 3
+60 60 61 30
+60 88 89 7
+60 98 106 64
+60 138 139 15
+60 229 230 3
+60 243 244 7
+60 259 260 7
+60 273 274 7
+60 282 283 7
+60 306 307 3
+60 306 307 7
+60 329 330 3
+60 329 330 5007
+61 0 11 46280
+61 1 30 66
+61 1 32 57
+61 1 32 5
+61 8 9 10
+61 31 32 27
+61 111 112 343
+61 120 121 27
+61 122 123 158
+61 203 268 133
+61 271 367 133
+61 454 556 233
+61 500 501 15
+61 623 623 3
+61 626 626 2
+61 746 747 3
+61 749 763 27
+62 0 1 30593
+62 1 256 396
+62 7 126 190
+62 92 189 143
+62 105 112 18701
+62 192 256 71
+62 282 283 18200
+62 485 485 15
+62 515 516 26
+62 630 669 5073
+63 0 4 57468
+63 1 94 37
+63 1 94 165
+63 1 234 13
+63 1 283 104
+63 91 283 329
+63 158 159 3
+63 160 161 3
+63 160 161 7
+63 163 164 7
+63 163 164 10
+63 164 165 831
+63 166 167 3
+63 166 167 7
+63 174 175 8
+63 175 176 3
+63 175 176 7
+63 188 283 66
+63 248 700 541
+63 285 285 5122
+63 285 508 411
+63 285 508 1993
+63 285 608 358
+63 286 375 66
+63 428 563 66
+63 566 654 187
+63 625 626 594
+63 627 628 32
+63 627 628 27
+63 627 628 3
+63 627 628 8
+63 627 628 27
+63 632 633 3
+63 632 633 8
+63 634 635 3
+63 634 635 14
+63 657 714 133
+63 660 661 3
+63 662 663 3
+63 667 668 14
+63 670 767 19
+64 0 0 32571
+64 1 516 808
+64 177 275 163
+64 369 464 117
+64 607 608 1399
+64 610 610 1
+64 644 663 2
+64 644 691 5004
+65 1 34 591
+65 1 78 201
+65 1 533 8
+65 1 547 88
+65 30 31 691
+65 80 122 142
+65 93 181 513
+65 107 108 15
+65 124 533 1450
+65 183 951 494
+65 257 533 121
+65 257 547 54
+65 264 265 41
+65 272 359 338
+65 343 533 108
+65 362 443 338
+65 528 951 44
+65 532 533 64
+65 532 533 53
+65 532 533 3
+65 535 547 3
+65 535 931 28
+65 550 660 392
+65 590 591 56
+65 590 591 5
+65 590 591 19
+65 590 591 7
+65 590 591 11
+65 590 591 7
+65 601 602 71
+65 663 724 66
+65 723 724 15
+65 727 847 435
+65 850 931 133
+65 930 931 3287
+65 934 1016 175
+65 938 967 12
+65 950 951 3378
+65 950 951 14
+65 953 961 13332
+65 1015 1016 3
+65 1015 1016 19
+65 1015 1016 27
+65 1018 1034 11
+66 0 0 35897
+66 1 249 217
+66 19 20 14
+66 19 20 19
+66 19 20 8
+66 63 153 114
+66 202 203 26
+66 222 321 313
+66 251 331 103
+66 320 321 35
+66 323 331 61
+66 331 600 5156
+67 1 249 381
+67 1 249 829
+67 85 208 558
+67 105 106 28
+67 105 106 166
+67 117 118 203
+67 131 132 44
+67 211 249 69
+67 213 214 262
+67 216 835 5060
+68 0 1 39682
+68 1 29 286
+68 1 30 6
+68 1 85 14
+68 45 49 40
+68 87 234 14
+68 88 169 276
+68 88 234 44
+68 101 234 2
+68 172 450 5071
+69 0 5 103991
+69 7 9 8
+69 26 27 14
+69 26 27 8
+69 113 114 436
+69 206 368 160
+70 1 384 130
+70 1 385 385
+70 1 385 138
+70 1 385 60
+70 1 387 368
+70 38 385 990
+70 38 385 68
+70 38 386 741
+70 39 385 314
+70 119 385 7
+70 147 385 3
+70 147 385 7
+70 176 385 14
+70 204 386 7
+70 273 386 3
+70 280 384 3
+70 282 385 58
+70 282 387 31
+70 324 385 3
+70 372 383 3
+70 374 384 8
+70 374 385 3
+70 374 385 74
+70 374 385 7
+70 377 385 5000
+70 377 386 7
+71 0 22 45263
+71 1 7 79
+71 1 22 13
+71 1 226 271
+71 10 226 1272
+71 12 22 15
+71 21 618 1
+71 24 40 3
+71 24 40 5
+71 24 618 56
+71 123 124 82
+71 225 226 7
+71 225 226 29
+71 229 299 281
+71 237 238 3
+71 237 238 14
+71 249 250 20
+71 255 256 29
+71 299 300 32
+71 320 321 32
+71 390 391 8
+71 390 391 36
+71 393 482 548
+71 482 483 8
+71 482 483 51
+71 534 535 26
+71 573 574 4
+71 576 796 25
+72 1 20 296
+72 6 7 225
+72 6 7 105
+72 13 14 71
+72 19 20 58
+72 22 69 5115
+73 1 508 242
+73 1 508 151
+73 1 692 60
+73 14 775 4356
+73 56 114 230
+73 109 998 2649
+73 117 177 185
+73 180 272 185
+73 275 360 185
+73 363 445 281
+73 368 998 2298
+73 444 445 3
+73 448 548 702
+73 508 511 9571
+73 511 599 44
+73 544 545 3
+73 544 545 3
+73 551 998 8
+73 549 550 55
+73 564 565 3
+73 578 579 29
+73 591 595 11095
+73 591 592 55
+73 601 696 36
+73 601 998 83
+73 619 620 3
+73 628 629 55
+73 649 957 86
+73 666 667 23
+73 669 670 11
+73 690 691 55
+73 698 813 38
+73 704 705 26
+73 716 717 3
+73 736 737 58
+73 736 737 3
+73 736 737 18
+73 739 838 119
+73 753 754 55
+73 805 806 2
+73 817 884 562
+73 821 832 21478
+73 840 998 935
+73 842 843 3
+73 842 843 14
+73 863 864 3
+73 863 864 24
+73 887 897 3
+73 887 998 722
+73 919 920 29
+73 921 922 23
+73 926 927 3
+73 930 998 146
+73 939 940 14
+73 959 998 15
+73 971 972 25
+73 993 998 1
+73 991 992 3
+73 1057 1973 18000
+74 0 0 6944
+74 1 19 74
+74 1 2 27
+74 7 55 20731
+75 0 5 36462
+75 5 467 353
+75 17 704 744
+75 93 1685 1034
+75 156 157 220
+75 228 228 2888
+75 230 766 626
+75 294 519 21
+75 294 766 141
+75 294 865 69
+75 294 1685 2200
+75 464 469 0
+75 485 545 80
+75 518 526 6196
+75 521 766 40
+75 528 542 31445
+75 526 527 482
+75 567 568 190
+75 584 766 134
+75 624 625 482
+75 627 630 7702
+75 706 711 21800
+75 706 766 91
+75 706 766 12
+75 706 862 1396
+75 732 824 230
+75 768 862 36
+75 769 773 11680
+75 769 1521 302
+75 794 795 25
+75 863 864 2807
+75 864 1665 2353
+75 885 885 2095
+75 987 1095 152
+75 1001 1002 25
+75 1001 1002 3
+75 1067 1068 3
+75 1067 1068 9
+75 1158 1159 7
+75 1215 1303 63
+75 1220 1221 9
+75 1311 1312 49
+75 1314 1521 152
+75 1334 1335 75
+75 1366 1379 9
+75 1370 1371 851
+75 1397 1480 213
+75 1431 1432 25
+75 1431 1432 3
+75 1431 1432 8
+75 1459 1460 49
+75 1483 1568 288
+75 1518 1536 12451
+75 1548 1685 26
+75 1561 1562 25
+75 1577 1578 3
+75 1605 1606 32
+75 1607 1608 482
+75 1615 1685 427
+75 1687 1743 19
+75 1687 1743 2
+75 1727 2055 5075
+76 0 0 30445
+76 1 39 268
+76 66 67 3
+76 66 67 15
+76 66 67 7
+76 138 139 5027
+77 1 30 152
+77 7 35 1
+77 33 86 176
+77 249 250 129
+77 285 417 126
+78 0 13 44234
+79 0 4 43042
+79 1 35 67
+79 1 102 133
+79 93 151 135
+79 101 102 35
+79 101 102 29
+79 101 102 9
+79 104 276 237
+79 104 276 246
+79 153 453 22
+79 154 276 110
+79 153 154 27
+79 153 154 68
+79 449 472 55
+80 0 0 5761
+81 0 2 39437
+81 0 802 1
+81 1 2 1
+81 1 802 84
+81 1 802 696
+81 1 802 229
+81 4 784 70
+81 48 49 34
+81 48 49 54
+81 48 49 15
+81 48 49 6
+81 48 49 8
+81 48 49 11
+81 52 92 138
+81 95 175 206
+81 193 193 6728
+81 265 266 9
+81 375 435 238
+81 391 392 204
+81 391 392 175
+81 438 510 138
+81 513 608 69
+81 786 802 3
+81 787 1943 5204
+82 0 85 6167
+83 1 36 276
+83 9 1802 287
+83 38 375 699
+83 98 186 276
+83 270 375 276
+83 305 306 167
+83 377 1802 4393
+83 378 434 69
+83 540 613 276
+83 552 618 95
+83 617 618 1323
+83 826 890 69
+83 1001 1068 69
+83 1071 1175 263
+83 1132 1133 232
+83 1178 1244 69
+83 1247 1362 207
+83 1249 1250 23
+83 1449 1595 138
+83 1562 1562 3699
+83 1598 1689 69
+83 1687 1802 2
+83 1766 1892 69
+84 0 260 6798
+85 0 6 57434
+85 1 29 185
+85 1 894 1624
+85 32 85 104
+85 69 198 39
+85 186 252 168
+85 201 937 433
+85 255 354 127
+85 357 441 104
+85 623 728 12
+85 623 728 157
+85 647 728 104
+85 822 938 64
+85 940 1302 442
+85 962 963 352
+85 1197 1198 3
+85 1294 1306 6
+85 1294 1306 15
+85 1313 1337 279
+86 0 34 5489
+87 1 66 65
+87 1 441 2528
+87 1 441 1112
+87 40 86 262
+87 68 68 2969
+87 69 93 12
+87 95 441 56
+87 134 134 3138
+87 143 145 32766
+87 172 174 3971
+87 180 441 456
+87 181 289 304
+87 182 183 1846
+87 193 441 509
+87 193 195 2484
+87 386 441 28
+87 424 1964 9899
+88 0 0 7477
+89 0 1 33190
+89 1 751 652
+89 37 131 187
+89 37 423 995
+89 99 99 2609
+89 115 118 5430
+89 115 751 1870
+89 134 194 71
+89 197 285 142
+89 366 454 142
+89 425 751 906
+89 457 544 71
+89 547 634 71
+89 637 2023 71
+90 0 185 5941
+91 8 102 221
+91 10 727 1207
+91 24 77 76
+91 80 168 76
+91 353 441 76
+91 633 713 76
+91 716 891 76
+92 0 57 8739
+93 1 21 228
+93 1 127 144
+93 15 19 14275
+93 23 332 6
+93 24 78 273
+93 81 190 175
+93 368 456 76
+93 734 852 76
+94 0 0 5896
+95 1 1564 64
+95 1 1565 76
+95 1 1565 114
+95 1 1565 25
+95 6 1565 1
+95 98 1563 69
+95 182 1564 69
+95 268 1565 69
+95 364 1565 139
+95 435 1565 111
+95 435 1566 36
+95 435 1566 28
+95 457 1566 284
+95 498 1566 36
+95 498 1566 28
+95 571 1566 55
+95 634 1564 16
+95 698 1565 36
+95 698 1566 16
+95 799 1566 55
+95 799 1566 3
+95 799 1566 111
+95 800 1565 195
+95 865 1565 55
+95 922 1565 55
+95 923 1564 170
+95 923 1566 195
+95 994 1567 55
+95 995 1565 207
+95 995 1566 111
+95 1050 1565 44
+95 1113 1564 55
+95 1113 1565 170
+95 1202 1566 139
+95 1271 1565 44
+95 1358 1567 44
+95 1359 1565 139
+95 1408 1567 28
+95 1420 1565 25740
+95 1491 1566 28
+95 1503 1564 3
+95 1503 1565 18
+95 1517 1564 28
+96 0 0 5000
+97 11 17 19125
+97 13 15 4
+97 17 648 1985
+97 188 283 285
+97 201 283 184
+97 229 230 34
+97 285 289 16
+97 284 285 6
+97 284 285 359
+97 347 348 6
+97 369 1597 934
+97 404 405 6
+97 404 405 359
+97 466 467 6
+97 466 467 359
+97 482 585 465
+97 536 537 359
+97 575 576 41
+97 575 576 31
+97 576 577 36
+97 588 649 347
+97 600 601 828
+97 600 601 866
+97 603 646 78
+97 615 616 6
+97 646 647 34
+97 648 649 204
+97 656 656 17389
+97 680 681 34
+97 808 809 34
+97 830 831 359
+97 858 859 6
+97 893 894 6
+97 1011 1076 275
+97 1016 1017 6
+97 1079 1159 387
+97 1082 1083 359
+97 1110 1117 23
+97 1109 1110 6
+97 1138 1139 6
+97 1138 1139 359
+97 1162 1255 509
+97 1172 1173 359
+97 1200 1201 6
+97 1200 1201 359
+97 1218 1226 76
+97 1228 1229 6
+97 1228 1229 359
+97 1255 1257 17208
+97 1262 1263 5
+97 1262 1263 359
+97 1277 1278 90
+97 1290 1291 5
+97 1320 1321 5
+97 1355 1356 5
+97 1412 1413 5
+97 1464 1580 970
+97 1515 1516 34
+97 1524 1525 1172
+97 1537 1538 5
+97 1565 1566 5
+97 1599 1611 0
+98 0 137 0
+99 1 1636 3
+99 5 1635 32764
+99 29 1636 79
+99 121 1635 252
+100 0 93 5738
+;
+run;
+
+/*Below we reproduce #s in tables in manuscript */
+*datasets used for BT only are located shortly after BT macro above;
+*Table 1;
+%bt(example1, L = 7);
+
+*Table 2;
+/*if you want to read in from external Excel xlsx files;
+of note, n=30 and n=100 data (not history) are already within this SAS program after BT macro.*/
+libname local 'C:\Temp\BT_ZT';
+PROC IMPORT OUT= WORK.CLV_surv DATAFILE= "C:\Temp\BT_ZT\CLV_Surv.xlsx" DBMS=xlsx REPLACE; GETNAMES=YES;RUN;
+PROC IMPORT OUT= WORK.CLV_cost DATAFILE= "C:\Temp\BT_ZT\CLV_Cost.xlsx" DBMS=xlsx REPLACE; GETNAMES=YES;RUN;
+
+/*proc print data=WORK.CLV_cost;run;*/
+* 2-5 rows;
+%bt_zt(surv_ds = WORK.CLV_surv, cost_ds = WORK.CLV_cost, L=36*30.4); 
+%bt_zt(surv_ds = WORK.CLV_surv, cost_ds = WORK.CLV_cost, L=26*30.4); 	
+%bt_zt(surv_ds = WORK.CLV_surv, cost_ds = WORK.CLV_cost, L=24*30.4); 
+%bt_zt(surv_ds = WORK.CLV_surv, cost_ds = WORK.CLV_cost, L=20*30.4); 	
+
+data CLV_surv; set WORK.CLV_surv;
+totcost=clv;
+run;
+%bt(ds=WORK.CLV_surv, L=36*30.4); 	
+%bt(ds=WORK.CLV_surv, L=26*30.4); 
+%bt(ds=WORK.CLV_surv, L=24*30.4); 	
+%bt(ds=WORK.CLV_surv, L=20*30.4); 	
+* 1st row;
+data CLV_surv2; set WORK.CLV_surv;
+totcost=clv;
+if id=27 then delta=0;*to be original;
+run;
+%bt_zt(surv_ds = CLV_surv2, cost_ds = WORK.CLV_cost, L=36*30.4); 
+%bt(ds=CLV_surv2, L=36*30.4); 
+
+*Table 3;
+%bt_zt(surv_ds = synth_surv, cost_ds = synth_cost, L = 1826, r=0.03, rcost=0.03);
+%bt_zt(surv_ds = synth_surv, cost_ds = synth_cost, L = 1643, r=0.03, rcost=0.03);
+%bt_zt(surv_ds = synth_surv, cost_ds = synth_cost, L = 1461, r=0.03, rcost=0.03);
+%bt_zt(surv_ds = synth_surv, cost_ds = synth_cost, L = 1826, r=0.02, rcost=0.05);
+%bt_zt(surv_ds = synth_surv, cost_ds = synth_cost, L = 1643, r=0.02, rcost=0.05);
+%bt_zt(surv_ds = synth_surv, cost_ds = synth_cost, L = 1461, r=0.02, rcost=0.05);
+%bt_zt(surv_ds = synth_surv, cost_ds = synth_cost, L = 1826);
+%bt_zt(surv_ds = synth_surv, cost_ds = synth_cost, L = 1643);
+%bt_zt(surv_ds = synth_surv, cost_ds = synth_cost, L = 1461);
+
+* Table 4;
+data one1; 
+*these 5 values can be computed from BT or ZT - same codes are also in Appendix 2 within text;
+surv=1069/365.25;
+sesurv=62/365.25;
+cost=32844;
+secost=4349;
+covcs=61058/365.25; run;
+
+data one2; set one1;
+ t=1.96;
+ x=cost;
+ y=surv;
+ sxx=secost**2;
+ syy=sesurv**2;
+ sxy=covcs;
+
+ acer=cost/surv;
+*Fieller;
+ f=(x*y-t**2*sxy)**2-(x**2-t**2*sxx)*(y**2-t**2*syy);
+ lowbd=(x*y-t**2*sxy-sqrt(f))/(y**2-t**2*syy);
+ uppbd=(x*y-t**2*sxy+sqrt(f))/(y**2-t**2*syy);
+*Taylor;
+ var_acer=(cost/surv)**2*(secost**2/cost**2+sesurv**2/surv**2-2*covcs/(cost*surv));
+ lowbd_taylor=acer-t*sqrt(var_acer);
+ uppbd_taylor=acer+t*sqrt(var_acer); run;
+
+proc print data=one2; var acer lowbd uppbd; run;
+proc print data=one2; var acer lowbd_taylor uppbd_taylor; run;
+
+data two1; 
+*need two groups so run BT or ZT for 2 groups first;
+surv1=1069/365.25;
+sesurv1=62/365.25;
+cost1=32844/1000;
+secost1=4349/1000;
+covcs1=61058/365.25/1000;
+
+surv2=1170/365.25;
+sesurv2=80/365.25;
+cost2=56718/1000;
+secost2=6000/1000;
+covcs2=60000/365.25/1000; run;
+
+data two2; set two1;
+ t=1.96; 
+ x=cost2-cost1;
+ y=surv2-surv1;
+ sxx=secost1**2+secost2**2;
+ syy=sesurv1**2+sesurv2**2;
+ sxy=covcs1+covcs2;
+
+ icer=(cost2-cost1)/(surv2-surv1);
+*Fieller;
+ f=(x*y-t**2*sxy)**2-(x**2-t**2*sxx)*(y**2-t**2*syy);
+ lowbd=(x*y-t**2*sxy-sqrt(f))/(y**2-t**2*syy);
+ uppbd=(x*y-t**2*sxy+sqrt(f))/(y**2-t**2*syy); run;
+
+proc print data=two2; var icer lowbd uppbd; run;
+
+* Table A2;
+* Case 1;
+data example1_2;
+  input id delta surv totcost;
+datalines;
+1 0 2 1
+2 1 2 10
+3 0 4 7
+4 1 4 5
+5 0 5 9
+6 1 6 8
+7 1 7 10
+;
+run;
+%bt(example1_2, L = 7, r = 0);
+
+* Case 2: demo data from R package website;
+data r_surv;
+	input id delta surv;
+datalines;
+1 0 343
+2 0 903
+3 1 445
+4 1 652
+;
+run;
+data r_cost;
+	input cid start stop cost;
+datalines;
+1 1 1 550
+1 30 82 1949
+1 88 88 45
+2 18 198 4245
+3 1 5 23
+3 67 88 567
+4 43 44 300
+;
+run;
+%bt_zt(surv_ds = r_surv, cost_ds = r_cost, L = 652, r = 0);
+
+
+
