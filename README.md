@@ -13,3 +13,9 @@ Eduard Poltavskiy<sup>1</sup>, Dingning Liu<sup>2</sup>, Shuai Chen<sup>2-4</sup
 
 5 Division of Occupational and Environmental Health, School of Medicine, University of Utah, Salt Lake City, UT, USA.
  
+
+| Files | Details |
+| --- | --- |
+| Supplement 1 | SAS macros for BT estimator only (%BT) and BT and ZT estimators together (%BT_ZT), and sample runs to reproduce results in our tables |
+| Supplement 2 | SAS macros only |
+| Supplement 3 | SAS codes for CEA |
